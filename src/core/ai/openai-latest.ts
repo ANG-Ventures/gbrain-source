@@ -37,7 +37,9 @@
  * Tier mapping mirrors the Anthropic ladder in TIER_DEFAULTS:
  *   utility → cheapest class (luna | nano | mini), reasoning/subagent → mid
  *   class (terra, else the flagship), deep → top class (sol | pro, else the
- *   bare family alias).
+ *   bare family alias). utility/reasoning/subagent come from the newest family
+ *   that has a terra; deep from the newest family. Ids containing "astra" are
+ *   never ranked.
  */
 
 import { readFileSync, writeFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
@@ -108,6 +110,8 @@ export interface ParsedOpenAIChatId {
 
 /** Parse a chat-shaped GPT id; null for anything outside the known grammar. */
 export function parseOpenAIChatId(id: string): ParsedOpenAIChatId | null {
+  // Astra is opt-in only (fleet seat policy): never an automatic pick for any tier.
+  if (id.includes('astra')) return null;
   const m = /^gpt-(\d+)(?:\.(\d+))?(?:-([a-z]+))?$/.exec(id);
   if (!m) return null;
   const suffix = m[3] ?? '';
@@ -157,17 +161,28 @@ export function rankOpenAIChatModels(
     ? newestSkipped.id
     : undefined;
 
-  // Tier picks degrade WITHIN the newest priced family — an account exposing
-  // only a partial family (e.g. terra/luna without sol or the bare alias)
-  // still gets usable tiers rather than tiers:null and a static fallback the
-  // account may not serve. Since `members` is non-empty, every tier resolves.
-  // Top: named top tier, else the bare family alias, else the best remaining.
-  const top = pickBySuffix(members, TOP_SUFFIXES) ?? pickBySuffix(members, [''])
-    ?? pickBySuffix(members, MID_SUFFIXES) ?? pickBySuffix(members, CHEAP_SUFFIXES);
-  // Mid: named mid tier, else the bare alias, else top.
-  const mid = pickBySuffix(members, MID_SUFFIXES) ?? pickBySuffix(members, ['']) ?? top;
-  // Cheap: named cheap tier, else mid.
-  const cheap = pickBySuffix(members, CHEAP_SUFFIXES) ?? mid;
+  // Tier picks degrade WITHIN a family — an account exposing only a partial
+  // family (e.g. terra/luna without sol or the bare alias) still gets usable
+  // tiers rather than tiers:null and a static fallback the account may not
+  // serve. Since `fam` is non-empty, every tier resolves.
+  const ladder = (fam: ParsedOpenAIChatId[]) => {
+    // Top: named top tier, else the bare family alias, else the best remaining.
+    const top = pickBySuffix(fam, TOP_SUFFIXES) ?? pickBySuffix(fam, [''])
+      ?? pickBySuffix(fam, MID_SUFFIXES) ?? pickBySuffix(fam, CHEAP_SUFFIXES);
+    // Mid: named mid tier, else the bare alias, else top.
+    const mid = pickBySuffix(fam, MID_SUFFIXES) ?? pickBySuffix(fam, ['']) ?? top;
+    // Cheap: named cheap tier, else mid.
+    return { top, mid, cheap: pickBySuffix(fam, CHEAP_SUFFIXES) ?? mid };
+  };
+  const { top } = ladder(members);
+  // Routine tiers (utility/reasoning/subagent) anchor on the newest family that
+  // ships a terra-class model, so a new top-class pricing row (gpt-6.2-sol) never
+  // moves them onto a dearer model by accident. No terra anywhere: newest family.
+  const terraFamily = eligible.filter((p) => (MID_SUFFIXES as readonly string[]).includes(p.suffix))
+    .reduce<[number, number] | null>((best, p) => (!best || familyCmp(p.family, best) > 0 ? p.family : best), null);
+  const { mid, cheap } = terraFamily
+    ? ladder(eligible.filter((p) => familyCmp(p.family, terraFamily) === 0))
+    : ladder(members);
   if (!top || !mid || !cheap) return { tiers: null, newestUnpriced };
 
   return {

@@ -362,3 +362,52 @@ describe('coverage-gap additions (ship review)', () => {
     expect(latestOpenAITiers()).toBeNull();
   });
 });
+
+describe('a new pricing row must not move a routine tier (GPT-6.2 rollout, t_a1eba3c0)', () => {
+  // Account shape at the 6.2 rollout; the default priced filter reads the real
+  // canonical table, which carries the gpt-6.2-sol and gpt-6.2-astra rows.
+  const ACCOUNT_6_2 = [
+    'gpt-6.2-astra', 'gpt-6.2-sol', 'gpt-6.1-sol', 'gpt-6.1-terra',
+    'gpt-5.6', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-4o-mini',
+  ];
+
+  test('no Anthropic key: utility/reasoning/subagent stay on gpt-6.1-terra with the 6.2 rows priced', async () => {
+    await refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'k' },
+      fetchImpl: fetchReturning(ACCOUNT_6_2),
+      force: true,
+    });
+    for (const tier of ['utility', 'reasoning', 'subagent'] as const) {
+      expect(resolveTierDefault(tier, { OPENAI_API_KEY: 'k' })).toBe('openai:gpt-6.1-terra');
+    }
+  });
+
+  test('an astra id is never an automatic pick, even when priced and alone', () => {
+    expect(parseOpenAIChatId('gpt-6.2-astra')).toBeNull();
+    expect(rankOpenAIChatModels(['gpt-6.2-astra'], () => true).tiers).toBeNull();
+    const { tiers } = rankOpenAIChatModels(ACCOUNT_6_2, () => true);
+    for (const pick of Object.values(tiers ?? {})) expect(pick).not.toContain('astra');
+  });
+
+  test('an explicitly configured tier still wins over the discovered default', async () => {
+    await refreshLatestOpenAIModels({
+      env: { OPENAI_API_KEY: 'k' },
+      fetchImpl: fetchReturning(ACCOUNT_6_2),
+      force: true,
+    });
+    const priorKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'k';
+    try {
+      const { resolveModel } = await import('../src/core/model-config.ts');
+      const cfg = new Map([['models.tier.reasoning', 'openai:gpt-6.2-sol']]);
+      const engine = { getConfig: async (k: string) => cfg.get(k) ?? null };
+      expect(await resolveModel(engine as never, { tier: 'reasoning', fallback: 'sonnet' }))
+        .toBe('openai:gpt-6.2-sol');
+      expect(await resolveModel(engine as never, { tier: 'utility', fallback: 'sonnet' }))
+        .toBe('openai:gpt-6.1-terra');
+    } finally {
+      if (priorKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = priorKey;
+    }
+  });
+});
