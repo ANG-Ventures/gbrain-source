@@ -26,7 +26,27 @@ import { claudeCli } from '../src/core/ai/recipes/claude-cli.ts';
 import { ANTHROPIC_OUTPUT_CAPS } from '../src/core/brainstorm/judges.ts';
 import { estimateAnthropicCost } from '../src/core/brain-score-recommendations.ts';
 
-const VERIFIED_NON_ANTHROPIC_CACHE = new Set(['openai:gpt-6.1-sol', 'openai:gpt-6.1-terra']);
+const VERIFIED_NON_ANTHROPIC_CACHE = new Set([
+  'openai:gpt-6.1-sol',
+  'openai:gpt-6.1-terra',
+  'openai:gpt-6.2-sol',
+  'openai:gpt-6.2-astra',
+]);
+
+test('gpt-6.2-sol and gpt-6.2-astra are priced at the models.dev <=272K rates with cache fields', () => {
+  expect(canonicalLookup('openai:gpt-6.2-sol')).toEqual({
+    input: 2,
+    output: 10,
+    cache_read: 0.1,
+    cache_write: 2.5,
+  });
+  expect(canonicalLookup('openai:gpt-6.2-astra')).toEqual({
+    input: 8,
+    output: 40,
+    cache_read: 0.4,
+    cache_write: 10,
+  });
+});
 
 test('gpt-6.1-sol is priced at the models.dev <=272K rates with cache fields', () => {
   expect(canonicalLookup('openai:gpt-6.1-sol')).toEqual({
