@@ -147,6 +147,10 @@ export const CANONICAL_PRICING: Record<string, ModelPricing> = {
   // gpt-6.1-terra (models.dev, 2026-11-06): the fleet Terra slot (t_527a3fd3).
   // <=272K-input rates; above 272K input the request bills 2 / 7.50 / 0.10 / 2.50.
   'openai:gpt-6.1-terra':                 { input:  1.00, output:  5.00, cache_read: 0.05, cache_write: 1.25 },
+  // gpt-6.2 family (models.dev, 2026-11-17): GPT-6.2 rollout G1, ADD-KEEP (t_42f93452).
+  // <=272K-input rates. Above 272K input: sol 4 / 15 / 0.20 / 5, astra 16 / 60 / 0.80 / 20.
+  'openai:gpt-6.2-sol':                   { input:  2.00, output: 10.00, cache_read: 0.10, cache_write: 2.50 },
+  'openai:gpt-6.2-astra':                 { input:  8.00, output: 40.00, cache_read: 0.40, cache_write: 10.00 },
 
   // ── Google ─────────────────────────────────────────────────────────────
   // `gemini-1.5-pro` was retired by Google (#3510); kept so historical
