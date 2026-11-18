@@ -395,13 +395,19 @@ describe('a new pricing row must not move a routine tier (GPT-6.2 rollout, t_a1e
       fetchImpl: fetchReturning(ACCOUNT_6_2),
       force: true,
     });
+    const priorKey = process.env.OPENAI_API_KEY;
     process.env.OPENAI_API_KEY = 'k';
-    const { resolveModel } = await import('../src/core/model-config.ts');
-    const cfg = new Map([['models.tier.reasoning', 'openai:gpt-6.2-sol']]);
-    const engine = { getConfig: async (k: string) => cfg.get(k) ?? null };
-    expect(await resolveModel(engine as never, { tier: 'reasoning', fallback: 'sonnet' }))
-      .toBe('openai:gpt-6.2-sol');
-    expect(await resolveModel(engine as never, { tier: 'utility', fallback: 'sonnet' }))
-      .toBe('openai:gpt-6.1-terra');
+    try {
+      const { resolveModel } = await import('../src/core/model-config.ts');
+      const cfg = new Map([['models.tier.reasoning', 'openai:gpt-6.2-sol']]);
+      const engine = { getConfig: async (k: string) => cfg.get(k) ?? null };
+      expect(await resolveModel(engine as never, { tier: 'reasoning', fallback: 'sonnet' }))
+        .toBe('openai:gpt-6.2-sol');
+      expect(await resolveModel(engine as never, { tier: 'utility', fallback: 'sonnet' }))
+        .toBe('openai:gpt-6.1-terra');
+    } finally {
+      if (priorKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = priorKey;
+    }
   });
 });
