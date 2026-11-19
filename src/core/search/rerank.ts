@@ -67,6 +67,13 @@ export interface RerankerOpts {
    * (those keep the per-query audit row instead).
    */
   onSkip?: (reason: RerankSkipReason) => void;
+  /**
+   * t_b0ef077a: set by hybridSearch when `timeoutMs` was cut down to the
+   * caller's remaining budget. A timeout then means "the budget ran out", not
+   * "the reranker is unhealthy": this hook fires instead of the failure audit
+   * row + fleet health edge, and the input order is returned.
+   */
+  onBudgetTimeout?: () => void;
 }
 
 /** The two skip classes (no HTTP call, no per-query audit row). */
@@ -160,6 +167,10 @@ export async function applyReranker(
     // the user migrates / adds the key. Fail open at once, tell the caller.
     if (reason === 'sunset_short_circuit' || reason === 'no_key') {
       try { opts.onSkip?.(reason); } catch { /* caller hook must never break search */ }
+      return results;
+    }
+    if (reason === 'timeout' && opts.onBudgetTimeout) {
+      try { opts.onBudgetTimeout(); } catch { /* caller hook must never break search */ }
       return results;
     }
     const errorSummary = err instanceof Error ? err.message : String(err);

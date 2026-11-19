@@ -26,6 +26,7 @@ import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
 import { setStageInfo, timeStage } from '../search/stage-timing.ts';
+import { resolveCallerBudgetMs } from '../search/caller-budget.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import {
   federatedSearchScope,
@@ -247,10 +248,13 @@ const search: Operation = {
     // Cheap-hybrid (D4/D15): full vector+keyword+RRF+pool+title+alias, but
     // expansion OFF (no per-call LLM cost). `query` op is the full-control variant.
     let capturedMeta: HybridSearchMeta | null = null;
+    // t_b0ef077a: per-caller budget (search.caller_budget_ms), counted from op start.
+    const budgetMs = await timeStage('op_config', () => resolveCallerBudgetMs(ctx.engine, ctx.auth?.clientName));
     const results = await hybridSearchCached(ctx.engine, queryText, {
       limit,
       offset,
       expansion: false,
+      ...(budgetMs ? { deadlineAt: startedAt + budgetMs } : {}),
       excludePrivate,
       ...(types ? { types } : {}),
       ...scope,

@@ -47,6 +47,7 @@ import {
 import { loadConfigWithEngine } from '../config.ts';
 import { dedupResults } from './dedup.ts';
 import { applyReranker, type RerankPassThroughReason, type RerankSkipReason } from './rerank.ts';
+import { rerankWindow } from './caller-budget.ts';
 import {
   classifyQuery,
   classifyQueryWithBrainPatterns,
@@ -1026,6 +1027,15 @@ export interface HybridSearchOpts extends SearchOpts {
    * public contract.
    */
   _telemetryCacheStatus?: 'miss' | 'disabled';
+
+  /**
+   * Fork-local (t_b0ef077a): absolute wall-clock deadline (Date.now() ms) for
+   * this search, set by the `search` op from `search.caller_budget_ms`. The
+   * reranker call is capped to the time left, or skipped when too little is
+   * left; either way the un-reranked order is returned and stamped
+   * `rerank_budget`. Undefined = no budget (behavior unchanged).
+   */
+  deadlineAt?: number;
 }
 
 /**
@@ -1391,7 +1401,7 @@ export async function hybridSearch(
     earlyModality === 'image'
       ? [[], []]
       : await timeStage('keyword', () => Promise.all([
-          engine.searchKeyword(query, searchOpts).catch((err: unknown) => {
+          engine.searchKeyword(capLexicalQuery(query), searchOpts).catch((err: unknown) => {
             if (isDbAccessFailure(err)) keywordAccessError = err;
             warnOncePerProcess(
               'search-keyword-arm-failed',
@@ -1400,7 +1410,7 @@ export async function hybridSearch(
             );
             return [] as SearchResult[];
           }),
-          engine.searchTitles(query, searchOpts).catch((err: unknown) => {
+          engine.searchTitles(capLexicalQuery(query), searchOpts).catch((err: unknown) => {
             if (isDbAccessFailure(err)) titleAccessError = err;
             warnOncePerProcess(
               'search-titles-arm-failed',
@@ -2181,9 +2191,32 @@ export async function hybridSearch(
     setStageInfo('rerank_in', deduped.length);
     if (typeof rerankerOpts.topNIn === 'number') setStageInfo('rerank_top_n_in', rerankerOpts.topNIn);
   }
-  const reranked = rerankerOpts.enabled
+  // t_b0ef077a: per-caller budget. Cap the rerank call to the time left
+  // before opts.deadlineAt, or skip it when too little is left. Either way the
+  // caller gets the un-reranked order, stamped `rerank_budget`.
+  const rrWindow = rerankerOpts.enabled
+    ? rerankWindow(opts?.deadlineAt, (rerankerOpts as { timeoutMs?: number }).timeoutMs)
+    : null;
+  const rrSkip = rrWindow?.skip === true;
+  const rrCap = rrWindow && rrWindow.skip === false && rrWindow.budgetCapped ? rrWindow : null;
+  if (rrSkip) {
+    pushDegraded(degraded, 'rerank_budget', 'budget_exhausted');
+    setStageInfo('rerank_budget', 'skipped');
+  } else if (rrCap) {
+    setStageInfo('rerank_budget_ms', rrCap.timeoutMs ?? 0);
+  }
+  const reranked = rerankerOpts.enabled && !rrSkip
     ? await timeStage('rerank', () => applyReranker(query, deduped, {
         ...(rerankerOpts as any),
+        ...(rrCap
+          ? {
+              timeoutMs: rrCap.timeoutMs,
+              onBudgetTimeout: () => {
+                pushDegraded(degraded, 'rerank_budget', 'timeout');
+                setStageInfo('rerank_budget', 'timeout');
+              },
+            }
+          : {}),
         onSkip: (reason: RerankSkipReason) => pushDegraded(degraded, 'reranker_skipped', reason),
         onPassThrough: (reason: RerankPassThroughReason) => {
           pushDegraded(degraded, 'rerank_passthrough', reason);
@@ -2192,7 +2225,7 @@ export async function hybridSearch(
         },
       }))
     : deduped;
-  if (rerankerOpts.enabled) setStageInfo('rerank_out', reranked.length);
+  if (rerankerOpts.enabled && !rrSkip) setStageInfo('rerank_out', reranked.length);
 
   // T3 — free-text alias hop. Runs AFTER rerank so a query that is a page's
   // declared chosen name reliably surfaces that page regardless of how the
@@ -2852,6 +2885,25 @@ export async function hybridSearchCached(
  * normal cache TTL.
  */
 export const DEGRADED_CACHE_TTL_SECONDS = 60;
+
+/**
+ * t_b0ef077a — longest query text the lexical arms (chunk FTS + title FTS)
+ * see. The mem0 prefetch sends whole user turns (pasted logs included); a
+ * 4.7k-8.8k-char turn compiles to a 1100-1900-node tsquery whose STRICT
+ * match alone ran 8.2-15 s on the live brain (1.0M chunks) and hit the 8 s
+ * statement_timeout, so the arm returned nothing after 8 s. 1939 chars ran
+ * 0.9 s. Same cap as the reranker's query cap. Vector + rerank still see
+ * the full text.
+ */
+export const LEXICAL_QUERY_MAX_CHARS = 2000;
+
+/** Cut `query` to LEXICAL_QUERY_MAX_CHARS, at the last whitespace when one is near. */
+export function capLexicalQuery(query: string): string {
+  if (query.length <= LEXICAL_QUERY_MAX_CHARS) return query;
+  const cut = query.slice(0, LEXICAL_QUERY_MAX_CHARS);
+  const ws = cut.search(/\s\S*$/);
+  return ws > LEXICAL_QUERY_MAX_CHARS * 0.8 ? cut.slice(0, ws) : cut;
+}
 
 /**
  * 2026-09 fix wave — pure gate for the OR-relaxed lexical demotion: is the
