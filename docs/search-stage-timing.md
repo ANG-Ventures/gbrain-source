@@ -90,3 +90,29 @@ This is a fork-local seam. On the next upstream sync: keep
 `serve-http.ts` (a conflict there means upstream moved the call); renumber
 migration v147 above upstream's latest version (the ALTER is
 `ADD COLUMN IF NOT EXISTS`, so re-running it under a new number is a no-op).
+
+## Per-caller budget (t_b0ef077a)
+
+A caller with a hard deadline can be given a search budget, so it gets the
+un-reranked top-k instead of a timeout when a stage runs long:
+
+```
+gbrain config set search.caller_budget_ms '{"rail-prod":12000}'
+```
+
+Keys are OAuth client names (`mcp_request_log.agent_name`), values are ms from
+the start of the `search` op. Read per call; no restart. With a budget, the
+reranker call gets `min(provider timeout, time left - 250 ms)`; with under
+300 ms left it is not called. Either way the results come back in RRF order and
+`meta.degraded` carries `{stage: 'rerank_budget', reason: 'timeout' |
+'budget_exhausted'}`; `stage_timing` carries `rerank_budget` (and
+`rerank_budget_ms` when the call was capped). A budget timeout writes no
+rerank-failure audit row and does not trip the reranker health alert. The
+semantic cache never stores such a result: the budget is per caller, so a
+stored row would be served un-reranked to callers with no budget.
+Remove with `gbrain config unset search.caller_budget_ms`.
+
+The lexical arms (chunk FTS + title FTS) see at most 2000 characters of the
+query (`LEXICAL_QUERY_MAX_CHARS` in `hybrid.ts`): longer turns compiled to
+1100-1900-node tsqueries that alone ran past the 8 s statement timeout.
+Vector and rerank still see the full text.

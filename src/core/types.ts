@@ -1824,6 +1824,13 @@ export interface EvalCaptureFailure {
  *                        otherwise a transitional relaxed-carried row would
  *                        shadow the recovered pipeline for the full TTL
  *                        under the same knobs hash (2026-09 red-team).
+ *   rerank_budget      — the caller's budget (search.caller_budget_ms,
+ *                        t_b0ef077a) cut the reranker: reason
+ *                        `budget_exhausted` (no window left, not called) or
+ *                        `timeout` (called with the remaining budget and it
+ *                        ran out). Results are in RRF order. Not ranking-only:
+ *                        the cache write takes the short TTL so the next
+ *                        unhurried call gets a reranked set.
  */
 export const DEGRADED_STAGES = [
   'embed_unavailable',
@@ -1839,6 +1846,7 @@ export const DEGRADED_STAGES = [
   'reranker_skipped',
   'rerank_passthrough',
   'keyword_relaxed_carried',
+  'rerank_budget',
 ] as const;
 export type DegradedStage = (typeof DEGRADED_STAGES)[number];
 
@@ -1860,6 +1868,8 @@ export const DEGRADED_REASONS = [
   // #4648 — rerank_passthrough reasons (mirror RerankPassThroughReason).
   'empty_result_set',
   'malformed_shape',
+  // t_b0ef077a — rerank_budget: the caller's budget left no rerank window.
+  'budget_exhausted',
 ] as const;
 export type DegradedReason = (typeof DEGRADED_REASONS)[number];
 
