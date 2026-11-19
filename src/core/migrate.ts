@@ -6452,6 +6452,17 @@ export const MIGRATIONS: Migration[] = [
     idempotent: true,
     sql: `ALTER TABLE page_versions ADD COLUMN IF NOT EXISTS title TEXT;`,
   },
+  {
+    version: 147,
+    name: 'mcp_request_log_stage_timing',
+    // Fork-local (ANG-Ventures t_c05f77e3): per-stage search/query timing
+    // (src/core/search/stage-timing.ts). Nullable JSONB, no default, no
+    // index: Postgres records it in the catalog only (no table rewrite, a
+    // brief ACCESS EXCLUSIVE lock). Rows without it stay NULL; the writer
+    // falls back to the pre-v147 insert when the column is absent.
+    idempotent: true,
+    sql: `ALTER TABLE mcp_request_log ADD COLUMN IF NOT EXISTS stage_timing JSONB;`,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

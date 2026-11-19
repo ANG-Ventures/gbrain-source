@@ -28,6 +28,7 @@ import {
 } from './validate-params.ts';
 import { backupCheckDisabled, backupNagGate, backupNoticeText, loadBackupStatus } from '../core/backup/status-file.ts';
 import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
+import { timeStage, timeStageSync } from '../core/search/stage-timing.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
 // surface). Re-exported here so existing imports/tests keep working.
@@ -682,7 +683,7 @@ export async function dispatchToolCall(
         ...(name === 'remember' && typeof r?.status === 'string' ? { remember_status: r.status } : {}),
       });
     }
-    const out: ToolResult = { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    const out: ToolResult = { content: [{ type: 'text', text: timeStageSync('format', () => JSON.stringify(result, null, 2)) }] };
     // D8: model-visible loudness for empty retrievals. The body stays a bare
     // array (D3 — deployed thin-clients parse content[0] only), and a SECOND
     // text block carries the diagnosis the model actually sees. Structured
@@ -720,7 +721,8 @@ export async function dispatchToolCall(
     // tool call to error.
     if (opts.metaHook) {
       try {
-        const meta = await opts.metaHook(name, ctx);
+        const metaHook = opts.metaHook;
+        const meta = await timeStage('meta_hook', () => metaHook(name, ctx));
         if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
       } catch (metaErr) {
         const msg = metaErr instanceof Error ? metaErr.message : String(metaErr);

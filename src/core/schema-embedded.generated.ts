@@ -644,6 +644,7 @@ CREATE TABLE IF NOT EXISTS mcp_request_log (
   status        TEXT NOT NULL DEFAULT 'success',
   params        JSONB,
   error_message TEXT,
+  stage_timing  JSONB,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
