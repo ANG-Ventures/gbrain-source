@@ -235,4 +235,28 @@ describe('hybridSearch with a caller deadline (t_b0ef077a)', () => {
     expect(other[0]!.rerank_score).toBe(0.9);
     await engine.unsetConfig(CALLER_BUDGET_CONFIG_KEY);
   });
+
+  test('search op: a budget-cut answer is not cached, so the next unbudgeted caller is reranked', async () => {
+    const { operations } = await import('../src/core/operations.ts');
+    const search = operations.find((o) => o.name === 'search')!;
+    const ctxFor = (clientName: string) => ({
+      engine, config: {}, logger: console, dryRun: false, remote: false, sourceId: 'default',
+      auth: { token: 't', clientId: `id-${clientName}`, clientName, scopes: ['read'] },
+    }) as any;
+    configure();
+    await engine.setConfig(CALLER_BUDGET_CONFIG_KEY, '{"rail-prod":1}');
+    await engine.executeRaw('DELETE FROM query_cache');
+    const calls = { n: 0 };
+    __setRerankTransportForTests(slowReranker(10, calls) as any);
+    const budgeted = (await search.handler(ctxFor('rail-prod'), { query: 'builder shipping', limit: 1 })) as SearchResult[];
+    expect(budgeted[0]!.rerank_score).toBeUndefined();
+    expect(calls.n).toBe(0);
+    await awaitPendingSearchCacheWrites();
+    // Same query, same scope, cache NOT cleared.
+    const other = (await search.handler(ctxFor('rail-cli'), { query: 'builder shipping', limit: 1 })) as SearchResult[];
+    expect(calls.n).toBe(1);
+    expect(other[0]!.rerank_score).toBe(0.9);
+    await engine.unsetConfig(CALLER_BUDGET_CONFIG_KEY);
+    await engine.executeRaw('DELETE FROM query_cache');
+  });
 });

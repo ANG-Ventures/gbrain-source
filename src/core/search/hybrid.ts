@@ -2851,8 +2851,13 @@ export async function hybridSearchCached(
   // degradations reach this write: a total embed outage has no
   // queryEmbedding (store() no-ops on null) and vector_enabled=false, so it
   // is uncacheable by construction.
+  // t_b0ef077a: a set the caller's budget left un-reranked (`rerank_budget`)
+  // is never stored. The budget is per caller and is not in knobsHash, so a
+  // stored row would be served to an unbudgeted caller as its answer.
+  const budgetCut = (finalMeta.degraded ?? []).some((d) => d.stage === 'rerank_budget');
   if (
     cacheStatus === 'miss' &&
+    !budgetCut &&
     queryEmbedding &&
     results.length > 0 &&
     (innerMeta?.vector_enabled ?? false)
