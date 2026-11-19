@@ -1,0 +1,14 @@
+[Unit]
+Description=zerank-2 native reranker (HF weights, gbrain)
+After=network.target
+
+[Service]
+Environment=CUDA_VISIBLE_DEVICES=GPU-31cbe110-66f1-da0c-dd4b-5cc60bcde854
+Environment=ZERANK_MODEL=zeroentropy/zerank-2-reranker
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ExecStart=/home/ace/zerank-serve/venv/bin/uvicorn zerank_server:app --host 127.0.0.1 --port 8084 --app-dir /home/ace/zerank-serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
