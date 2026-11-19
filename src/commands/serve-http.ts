@@ -165,6 +165,15 @@ import {
 } from '../core/ingestion/types.ts';
 import { resolveOwnerHolder } from '../core/owner-holder.ts';
 import { registerCleanup } from '../core/process-cleanup.ts';
+import {
+  STAGE_TIMED_OPS,
+  createStageTimer,
+  finalizeStageTiming,
+  insertToolCallLog,
+  recordSpan,
+  runWithStageTimer,
+  stageClock,
+} from '../core/search/stage-timing.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -2323,8 +2332,26 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
+  // Fork-local (t_c05f77e3): per-stage timing for search/query rows. The
+  // arrival stamp runs BEFORE bearer auth so stage_timing.auth_ms can name the
+  // token-verify time, which sits outside latency_ms (startTime is after it).
+  // `inflight` = /mcp requests open when this one started (queueing signal).
+  let mcpInflight = 0;
+  const stampMcpArrival = (req: Request, _res: Response, next: () => void): void => {
+    (req as any)._gbArrivedAt = stageClock();
+    next();
+  };
+  app.post('/mcp', stampMcpArrival, requireBearerAuth({ verifier: oauthProvider, resourceMetadataUrl }), async (req: Request, res: Response) => {
     const startTime = Date.now();
+    const stageTimer = createStageTimer();
+    mcpInflight += 1;
+    let inflightReleased = false;
+    res.on('close', () => { if (!inflightReleased) { inflightReleased = true; mcpInflight -= 1; } });
+    if (stageTimer) {
+      const authMs = stageTimer.startedAt - Number((req as any)._gbArrivedAt);
+      if (Number.isFinite(authMs)) stageTimer.info.auth_ms = Math.round(authMs * 10) / 10;
+      stageTimer.info.inflight = mcpInflight;
+    }
     const authInfo = (req as any).auth as AuthInfo;
 
     // Human-readable agent name is now threaded through AuthInfo by
@@ -2583,9 +2610,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         tokenSourceId,
       );
 
+      // t_c05f77e3: search/query run inside the request's stage timer.
+      // pre_dispatch = /mcp entry to here (surface + writeback config, SDK
+      // parse, federated scope); the op's own stages are recorded inside.
+      const timedTimer = STAGE_TIMED_OPS.has(name) ? stageTimer : null;
+      if (timedTimer) recordSpan(timedTimer, 'pre_dispatch', timedTimer.startedAt);
+      const dispatchT0 = stageClock();
       let toolResult: Awaited<ReturnType<typeof dispatchToolCall>>;
       try {
-        toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
+        toolResult = await runWithStageTimer(timedTimer, () => dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
           remote: true,
           // WP1/D7: network transport — the dispatch-layer localOnly
           // backstop keys off this marker.
@@ -2610,7 +2643,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
             warn: (msg: string) => console.error(`[WARN] ${msg}`),
             error: (msg: string) => console.error(`[ERROR] ${msg}`),
           },
-        });
+        }));
       } catch (e) {
         // dispatchToolCall absorbs OperationError + Error and returns
         // isError:true; only an unexpected throw lands here. Treat as the
@@ -2641,7 +2674,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         return { content: [{ type: 'text', text: JSON.stringify({ error: errorPayload }) }], isError: true };
       }
 
+      if (timedTimer) timedTimer.info.dispatch_ms = Math.round((stageClock() - dispatchT0) * 10) / 10;
       const latency = Date.now() - startTime;
+      const stageTiming = finalizeStageTiming(timedTimer, latency);
       if (toolResult.isError) {
         // dispatchToolCall serializes the error into the content text;
         // for the audit log we re-extract a message string for the
@@ -2659,13 +2694,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         } catch { /* ignore */ }
         const errStatus = requestLogStatusForResult(toolResult);
         try {
-          await executeRawJsonb(
-            engine,
-            `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
-             VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
-            [authInfo.clientId, agentName, name, latency, errStatus, errMsg],
-            [logParamsObj],
-          );
+          await insertToolCallLog(engine, {
+            tokenName: authInfo.clientId, agentName, operation: name, latencyMs: latency,
+            status: errStatus, errorMessage: errMsg, params: logParamsObj,
+          }, stageTiming);
         } catch { /* best effort */ }
         broadcastEvent({
           agent: agentName,
@@ -2686,13 +2718,10 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // status column). Warn CONTENTS (the raw unknown keys) are never logged.
       const successStatus = requestLogStatusForResult(toolResult);
       try {
-        await executeRawJsonb(
-          engine,
-          `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, params)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
-          [authInfo.clientId, agentName, name, latency, successStatus],
-          [logParamsObj],
-        );
+        await insertToolCallLog(engine, {
+          tokenName: authInfo.clientId, agentName, operation: name, latencyMs: latency,
+          status: successStatus, params: logParamsObj,
+        }, stageTiming);
       } catch { /* best effort */ }
       broadcastEvent({
         agent: agentName,

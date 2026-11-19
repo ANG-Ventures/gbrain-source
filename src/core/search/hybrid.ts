@@ -62,6 +62,7 @@ import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget, searchSalvageEnabled, type TokenBudgetMeta } from './token-budget.ts';
 import { warnOncePerProcess } from '../utils.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
+import { setStageInfo, timeStage, timeStageSync } from './stage-timing.ts';
 import {
   weightsForIntent,
   effectiveRrfK,
@@ -1178,7 +1179,7 @@ export async function hybridSearch(
   // per-mode evals would not test production search if modes lived only in
   // the wrapper. See `[CDX-5+6]` in the plan.
   const { loadSearchModeConfig, resolveSearchMode } = await import('./mode.ts');
-  const modeInput = await loadSearchModeConfig(engine);
+  const modeInput = await timeStage('config', () => loadSearchModeConfig(engine));
   const resolvedMode = resolveSearchMode({
     // T4/D5 — per-call mode selector (e.g. `--mode tokenmax`). The op layer
     // only passes this for trusted/local callers; remote callers leave it
@@ -1219,7 +1220,7 @@ export async function hybridSearch(
   // Failing cfg load (pre-config brain, mid-migration, no engine.getConfig)
   // falls through to the file-plane sync loadConfig() — same shape, just
   // misses DB-plane overrides.
-  const mergedCfg = await loadConfigWithEngine(engine).catch(() => null);
+  const mergedCfg = await timeStage('config', () => loadConfigWithEngine(engine).catch(() => null));
   const cfgForColumn = mergedCfg
     ?? ((await import('../config.ts')).loadConfig())
     ?? { engine: 'pglite' as const };
@@ -1239,7 +1240,7 @@ export async function hybridSearch(
   // weight-adjustment path. Intent weighting is on by default (off via
   // `opts.intentWeighting = false`; mode bundle supplies the default).
   // #4415: merges the brain's `search.intent_patterns` config over the banks.
-  const suggestions = await classifyQueryWithBrainPatterns(engine, query);
+  const suggestions = await timeStage('intent', () => classifyQueryWithBrainPatterns(engine, query));
   const intentWeightingOn = resolvedMode.intentWeighting;
   const intentWeights = intentWeightingOn
     ? weightsForIntent(suggestions.intent)
@@ -1389,7 +1390,7 @@ export async function hybridSearch(
   const [keywordResults, titleResults]: [SearchResult[], SearchResult[]] =
     earlyModality === 'image'
       ? [[], []]
-      : await Promise.all([
+      : await timeStage('keyword', () => Promise.all([
           engine.searchKeyword(query, searchOpts).catch((err: unknown) => {
             if (isDbAccessFailure(err)) keywordAccessError = err;
             warnOncePerProcess(
@@ -1408,7 +1409,7 @@ export async function hybridSearch(
             );
             return [] as SearchResult[];
           }),
-        ]);
+        ]));
   if (keywordAccessError && titleAccessError) {
     throw keywordAccessError;
   }
@@ -1457,7 +1458,7 @@ export async function hybridSearch(
   // path; the parser only matches text-shaped relational queries anyway.)
   let relationalList: SearchResult[] = [];
   if (resolvedMode.relationalRetrieval) {
-    relationalList = await buildRelationalArm(engine, query, {
+    relationalList = await timeStage('relational', () => buildRelationalArm(engine, query, {
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
       depth: resolvedMode.relational_retrieval_depth,
@@ -1467,7 +1468,7 @@ export async function hybridSearch(
       // remote relational query bypasses the keyword/vector visibility clause.
       excludePrivate: opts?.excludePrivate,
       onMeta: opts?.onRelationalMeta,
-    });
+    }));
   }
 
   // Skip vector search entirely if the gateway has no embedding provider configured (Codex C3).
@@ -1639,7 +1640,7 @@ export async function hybridSearch(
   ) {
     try {
       const { classifyModalityWithLLM } = await import('./llm-intent.ts');
-      regexModality = await classifyModalityWithLLM(query, 'text');
+      regexModality = await timeStage('modality_llm', () => classifyModalityWithLLM(query, 'text'));
     } catch {
       // Fail-open: regex result stands.
     }
@@ -1659,7 +1660,8 @@ export async function hybridSearch(
   const expansionAllowed = resolvedMode.expansion && effectiveModality !== 'image';
   if (expansionAllowed && opts?.expandFn) {
     try {
-      queries = await opts.expandFn(query);
+      const expandFn = opts.expandFn;
+      queries = await timeStage('expansion', () => expandFn(query));
       if (queries.length === 0) queries = [query];
       // "Applied" = produced variants beyond the original, not just called.
       expansionApplied = queries.length > 1;
@@ -1795,11 +1797,11 @@ export async function hybridSearch(
       // all-or-nothing fan-outs — one variant's failure abandons every
       // embedding and falls back to keyword-only.
       try {
-        const embeddings = await Promise.all(queries.map(q => embedOneQuery(q)));
+        const embeddings = await timeStage('embed', () => Promise.all(queries.map(q => embedOneQuery(q))));
         queryEmbedding = embeddings[0];
-        const textLists = await Promise.all(
+        const textLists = await timeStage('vector', () => Promise.all(
           embeddings.map(emb => engine.searchVector(emb, searchOpts)),
-        );
+        ));
         for (const list of textLists) {
           for (const r of list) {
             r.modality = r.modality ?? 'text';
@@ -1825,7 +1827,7 @@ export async function hybridSearch(
       // WP2/T3 (ENG-15) salvage fan-outs: allSettled on BOTH the embed
       // fan-out and the searchVector fan-out so one variant's failure no
       // longer abandons the survivors (the query-vs-search asymmetry fix).
-      const settled = await Promise.allSettled(queries.map(q => embedOneQuery(q)));
+      const settled = await timeStage('embed', () => Promise.allSettled(queries.map(q => embedOneQuery(q))));
       const okEmbeds: Float32Array[] = [];
       const embedFailures: unknown[] = [];
       for (const s of settled) {
@@ -1858,7 +1860,7 @@ export async function hybridSearch(
           queryEmbedding = null;
           pushDegraded(degraded, 'rescore_skipped', 'original_embed_failed');
         }
-        const vSettled = await Promise.allSettled(okEmbeds.map(emb => engine.searchVector(emb, searchOpts)));
+        const vSettled = await timeStage('vector', () => Promise.allSettled(okEmbeds.map(emb => engine.searchVector(emb, searchOpts))));
         const okLists: SearchResult[][] = [];
         let vFirstErr: unknown;
         let vFailed = 0;
@@ -2058,16 +2060,18 @@ export async function hybridSearch(
 
   // issue #160: stamp unverified auto-extracted stubs across ALL candidate
   // arms BEFORE fusion so the compiled-truth authority boost skips them.
-  await stampUnverifiedExtractions(engine, allLists.flatMap((l) => l.list));
+  await timeStage('fusion', () => stampUnverifiedExtractions(engine, allLists.flatMap((l) => l.list)));
 
-  let fused = rrfFusionWeighted(allLists, shouldBoostCompiledTruth(detail));
+  let fused = timeStageSync('fusion', () => rrfFusionWeighted(allLists, shouldBoostCompiledTruth(detail)));
 
   // Cosine re-scoring before dedup so semantically better chunks survive.
   // v0.36 (D9): hydrate from the active embedding column so rescore happens
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+    const qEmb = queryEmbedding;
+    const preRescore = fused;
+    fused = await timeStage('rescore', () => cosineReScore(engine, preRescore, qEmb, resolvedCol.name));
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -2075,7 +2079,8 @@ export async function hybridSearch(
   // boost surface. Salience and recency are independent axes — either,
   // both, or neither fires depending on resolved modes.
   if (fused.length > 0) {
-    await runPostFusionStages(engine, fused, postFusionOpts);
+    const postFusionPool = fused;
+    await timeStage('post_fusion', () => runPostFusionStages(engine, postFusionPool, postFusionOpts));
     // v0.32.x search-lite: intent exact-match boost (entity/event intents).
     // No-op when boost factor is 1.0 (general intent or weighting disabled).
     if (intentWeights.exactMatchBoost !== 1.0) {
@@ -2172,8 +2177,12 @@ export async function hybridSearch(
   // pass-through (#4648: provider answered 200 with an empty/malformed result
   // set) is stamped `rerank_passthrough`, so --explain, telemetry and eval rows
   // can tell "reranked" from "fell through in RRF order" — never stderr.
+  if (rerankerOpts.enabled) {
+    setStageInfo('rerank_in', deduped.length);
+    if (typeof rerankerOpts.topNIn === 'number') setStageInfo('rerank_top_n_in', rerankerOpts.topNIn);
+  }
   const reranked = rerankerOpts.enabled
-    ? await applyReranker(query, deduped, {
+    ? await timeStage('rerank', () => applyReranker(query, deduped, {
         ...(rerankerOpts as any),
         onSkip: (reason: RerankSkipReason) => pushDegraded(degraded, 'reranker_skipped', reason),
         onPassThrough: (reason: RerankPassThroughReason) => {
@@ -2181,17 +2190,18 @@ export async function hybridSearch(
           // Chain a per-call callback if the caller supplied one.
           (rerankerOpts as { onPassThrough?: (r: RerankPassThroughReason) => void }).onPassThrough?.(reason);
         },
-      })
+      }))
     : deduped;
+  if (rerankerOpts.enabled) setStageInfo('rerank_out', reranked.length);
 
   // T3 — free-text alias hop. Runs AFTER rerank so a query that is a page's
   // declared chosen name reliably surfaces that page regardless of how the
   // reranker scored body chunks. Fail-open on pre-v110 brains.
-  const preExact = await applyAliasHop(engine, reranked, query, {
+  const preExact = await timeStage('post_rerank', () => applyAliasHop(engine, reranked, query, {
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
     excludePrivate: opts?.excludePrivate,
-  });
+  }));
 
   // #1663 — structural exact-lookup tier: a query that IS a page identity
   // (slug / exact normalized title) gets that page at rank-1 regardless of
@@ -2199,7 +2209,7 @@ export async function hybridSearch(
   // the already-fetched title arm (no extra queries); pure no-op for
   // non-lookup-shaped queries. Runs after the alias hop so all three
   // identity surfaces (alias, slug, title) share the same injection shape.
-  const aliasHopped = await applyExactLookupTier(engine, preExact, query, {
+  const aliasHopped = await timeStage('post_rerank', () => applyExactLookupTier(engine, preExact, query, {
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
     titleCandidates: titleResults,
@@ -2207,7 +2217,7 @@ export async function hybridSearch(
     type: opts?.type,
     types: opts?.types,
     excludeSlugs: opts?.exclude_slugs,
-  });
+  }));
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
@@ -2298,7 +2308,7 @@ export async function hybridSearch(
   // hybridSearch enforces it too so eval-replay + eval-longmemeval see
   // the same budget behavior as the production query op.
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(sliced, resolvedMode.tokenBudget);
-  await stampContentFlags(engine, budgeted);
+  await timeStage('post_rerank', () => stampContentFlags(engine, budgeted));
   lastResultsCount = budgeted.length;
   lastRank1Score = budgeted[0] ? (budgeted[0].base_score ?? budgeted[0].score) : undefined;
   stampBudgetStage(degraded, budgetMeta);
@@ -2398,7 +2408,7 @@ export async function hybridSearchCached(
   // that scopes the cache row so a tokenmax write can't be served to a
   // conservative read. See [CDX-4] in the plan.
   const { loadSearchModeConfig, resolveSearchMode, knobsHash } = await import('./mode.ts');
-  const modeInputForCache = await loadSearchModeConfig(engine);
+  const modeInputForCache = await timeStage('config', () => loadSearchModeConfig(engine));
   const resolvedForCache = resolveSearchMode({
     // T4/D5 — per-call mode folds into the cache key (resolved_mode is part
     // of knobsHash) so a per-call `--mode tokenmax` read can't be served a
@@ -2443,7 +2453,7 @@ export async function hybridSearchCached(
   // provider/dim. isCacheSafe compares the resolved column's full
   // embedding space (name + dim + model) against cfg and returns true
   // only when ALL match. Otherwise skip.
-  const mergedCfgCached = await loadConfigWithEngine(engine).catch(() => null);
+  const mergedCfgCached = await timeStage('config', () => loadConfigWithEngine(engine).catch(() => null));
   const cfgCached = mergedCfgCached ?? ((await import('../config.ts')).loadConfig()) ?? { engine: 'pglite' as const };
   const resolvedColCached = resolveGenerationAwareColumn(opts, cfgCached);
   const isNonDefaultColumn = !isCacheSafe(resolvedColCached, cfgCached);
@@ -2454,7 +2464,7 @@ export async function hybridSearchCached(
   // hybridSearch resolves. Pre-fix, det= was computed via the pattern-less
   // global classifier, so a fresh process keyed its first cache row under a
   // pattern-less detail while the stored results used the pattern-aware one.
-  const intentStateForCache = await loadEngineIntentPatterns(engine);
+  const intentStateForCache = await timeStage('config', () => loadEngineIntentPatterns(engine));
   const cacheSuggestions = classifyQuery(query, intentStateForCache.banks);
 
   // 2026-08 fix wave (E5b): resolve the adaptive-return gate ONCE for both
@@ -2523,7 +2533,7 @@ export async function hybridSearchCached(
   // Cache decision: opts.useCache (explicit) wins over global config; global
   // config wins over mode bundle default. Mode bundle is on for all 3 modes
   // today; the resolver already folded everything through.
-  const cacheCfg = await loadCacheConfig(engine);
+  const cacheCfg = await timeStage('config', () => loadCacheConfig(engine));
   const cacheEnabled = resolvedForCache.cache_enabled;
   const cache = new SemanticQueryCache(engine, {
     ...cacheCfg,
@@ -2621,7 +2631,7 @@ export async function hybridSearchCached(
         // v0.42.20.0 (Fix 3) — bounded by the shared deadline; on timeout this
         // throws → caught below → cacheStatus 'disabled' → falls through to the
         // inner hybridSearch (which reuses the same elapsed deadline).
-        queryEmbedding = await embedQueryBounded(query, undefined, queryEmbedDl);
+        queryEmbedding = await timeStage('cache_embed', () => embedQueryBounded(query, undefined, queryEmbedDl));
       } else {
         cacheStatus = 'disabled';
       }
@@ -2632,9 +2642,11 @@ export async function hybridSearchCached(
   }
 
   if (!skipCache && queryEmbedding && cacheStatus !== 'disabled') {
-    const hit = await cache.lookup(queryEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash, queryText: query }); // queryText → #1469 text guard
+    const lookupEmbedding = queryEmbedding;
+    const hit = await timeStage('cache_lookup', () => cache.lookup(lookupEmbedding, { sourceId: cacheScopeKey(opts), knobsHash: cacheKnobsHash, queryText: query })); // queryText → #1469 text guard
     if (hit.hit && hit.results) {
       cacheStatus = 'hit';
+      setStageInfo('cache', 'hit');
       cacheSimilarity = hit.similarity;
       cacheAge = hit.ageSeconds;
 
@@ -2758,6 +2770,7 @@ export async function hybridSearchCached(
     },
   });
   const innerMeta = innerMetaBox.current;
+  setStageInfo('cache', cacheStatus);
 
   // Token budget pass (no-op when not set).
   const { results: budgeted, meta: budgetMeta } = enforceTokenBudget(results, opts?.tokenBudget);

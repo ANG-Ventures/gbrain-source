@@ -25,6 +25,7 @@ import { applySnippetCap, DEFAULT_AGENT_SNIPPET_CHARS } from '../search/snippet-
 import { resolveExcludePrivatePages } from '../search/private-visibility.ts';
 import { QUERY_DESCRIPTION, SEARCH_DESCRIPTION } from '../operations-descriptions.ts';
 import { OperationError } from './contract.ts';
+import { setStageInfo, timeStage } from '../search/stage-timing.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import {
   federatedSearchScope,
@@ -192,12 +193,13 @@ const search: Operation = {
   handler: async (ctx, p) => {
     const startedAt = Date.now();
     const queryText = p.query as string;
+    setStageInfo('query_len', typeof queryText === 'string' ? queryText.length : 0);
     const limit = (p.limit as number) || 20;
     const offset = (p.offset as number) || 0;
     // #3985: validated multi-type filter, threaded into both branches below.
     const types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
-    const snippetCap = await resolveSnippetCap(ctx, p);
+    const snippetCap = await timeStage('op_config', () => resolveSnippetCap(ctx, p));
     // #4398: explicit per-call source_id wins over ctx.sourceId, validated
     // (invalid ids throw invalid_params) then resolved through the single
     // trust+grant resolver (resolveRequestedScope inside federatedSearchScope)
@@ -207,7 +209,7 @@ const search: Operation = {
     const scope = federatedSearchScope(ctx, sourceIdParam);
     // #4352 — untrusted callers never see `visibility: private` pages
     // (config-gated; trusted local CLI unchanged).
-    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    const excludePrivate = await timeStage('op_config', () => resolveExcludePrivatePages(ctx.engine, ctx.remote));
 
     // T4/D5 — per-call mode honored ONLY for trusted/local callers so a remote
     // OAuth client can't escalate to the costly tokenmax bundle. Local + unknown
@@ -217,7 +219,7 @@ const search: Operation = {
     // T4/D17 — escape hatch: keyword-only when the operator opts out of the
     // hybrid `search` contract (privacy/cost: no query text to an embedding
     // provider). Defaults to cheap-hybrid (D4/D15).
-    const keywordOnly = (await ctx.engine.getConfig('search.mcp_keyword_only')) === 'true';
+    const keywordOnly = (await timeStage('op_config', () => ctx.engine.getConfig('search.mcp_keyword_only'))) === 'true';
 
     if (keywordOnly) {
       const raw = await ctx.engine.searchKeyword(queryText, { limit, offset, excludePrivate, ...(types ? { types } : {}), ...scope });
@@ -394,11 +396,12 @@ const query: Operation = {
     const expand = p.expand !== false;
     const detail = (p.detail as 'low' | 'medium' | 'high') || undefined;
     const queryText = p.query as string | undefined;
+    setStageInfo('query_len', typeof queryText === 'string' ? queryText.length : 0);
     // #3985: validated multi-type filter (text path; the image-similarity
     // branch below also honors it — searchVector filters types at SQL level).
     const types = normalizeTypesParam(p.types);
     // #3800: snippet cap (param > subagent config default > full text).
-    const snippetCap = await resolveSnippetCap(ctx, p);
+    const snippetCap = await timeStage('op_config', () => resolveSnippetCap(ctx, p));
     const imageData = p.image as string | undefined;
     const imageMime = (p.image_mime as string) || 'image/jpeg';
     const embeddingColumnParam =
@@ -417,7 +420,7 @@ const query: Operation = {
     const querySourceScope = federatedSearchScope(ctx, sourceIdParam);
     // #4352 — same enforcement for the full-control query op (both the image
     // searchVector branch and the text hybrid path below).
-    const excludePrivate = await resolveExcludePrivatePages(ctx.engine, ctx.remote);
+    const excludePrivate = await timeStage('op_config', () => resolveExcludePrivatePages(ctx.engine, ctx.remote));
 
     // v0.27.1: image-similarity branch. Bypasses hybridSearch (which is
     // text-only); embeds the image via embedMultimodal and runs a direct
