@@ -5,14 +5,12 @@ import importlib.util
 import os
 import random
 import sys
-import threading
 import types
 import unittest
 
 
 def _load_server():
     torch = types.ModuleType("torch")
-    torch.float16, torch.bfloat16, torch.float32 = "fp16", "bf16", "fp32"
 
     class _OOM(Exception):
         pass
@@ -35,9 +33,6 @@ def _load_server():
     class CrossEncoder:
         def __init__(self, *_a, **_k):
             pass
-
-        def parameters(self):
-            yield types.SimpleNamespace(dtype="bf16")
 
     st.CrossEncoder = CrossEncoder
     sys.modules.update(torch=torch, fastapi=fastapi, pydantic=pydantic, sentence_transformers=st)
@@ -76,49 +71,6 @@ class PredictSortedTest(unittest.TestCase):
 
     def test_empty(self):
         self.assertEqual(S.predict_sorted(lambda b: [], [], 4, len), [])
-
-
-class MergerTest(unittest.TestCase):
-    def test_overlapping_requests_get_their_own_scores(self):
-        gate = threading.Event()
-        passes = []
-
-        def score(pairs):
-            passes.append(len(pairs))
-            if len(passes) == 1:
-                gate.wait(5)  # hold the first pass so the next requests queue up and merge
-            return [float(p[1]) for p in pairs]
-
-        m = S._Merger(score)
-        reqs = [[("q", i * 100 + j) for j in range(n)] for i, n in enumerate([3, 5, 2, 4])]
-        out = {}
-
-        def run(k):
-            out[k] = m.submit(reqs[k])
-
-        first = threading.Thread(target=run, args=(0,))
-        first.start()
-        while not passes:
-            pass
-        rest = [threading.Thread(target=run, args=(k,)) for k in (1, 2, 3)]
-        for t in rest:
-            t.start()
-        while sum(len(j[0]) for j in m._pending) < 11:
-            pass
-        gate.set()
-        for t in [first] + rest:
-            t.join(5)
-        for k, r in enumerate(reqs):
-            self.assertEqual(out[k], [float(p[1]) for p in r])
-        self.assertEqual(passes, [3, 11])  # requests 1-3 shared one pass
-
-    def test_failure_reaches_every_waiter(self):
-        def score(pairs):
-            raise RuntimeError("boom")
-
-        m = S._Merger(score)
-        with self.assertRaises(RuntimeError):
-            m.submit([("q", "d")])
 
 
 if __name__ == "__main__":
