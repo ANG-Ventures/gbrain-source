@@ -4,10 +4,10 @@ usage: bench_pair.py <label> <out.jsonl> <port>:<cond> [<port>:<cond> ...]
 For each request, every instance gets the same request back to back (order rotated per request), so
 background load (live traffic, the sibling card's bench) lands on every condition alike.
 Per call: wall ms, top-3, GPU0 util before, sibling-bench-active flag. Prints p50/p90 per condition."""
-import json, os, subprocess, sys, time, urllib.request
+import http.client, json, os, subprocess, sys, time
 
 label, out = sys.argv[1], sys.argv[2]
-conds = [a.split(":", 1) for a in sys.argv[3:]]
+conds = [(int(p), c) for p, c in (a.split(":", 1) for a in sys.argv[3:])]  # port is an int: loopback only
 reqs = json.load(open("/home/ace/t_0930e064/requests50.json"))
 GPU0 = "GPU-31cbe110-66f1-da0c-dd4b-5cc60bcde854"
 
@@ -42,11 +42,14 @@ with open(out, "a") as f:
         order = conds[i % len(conds):] + conds[:i % len(conds)]
         for port, cond in order:
             util, sib = gpu0_util(), sibling_active()
-            rq = urllib.request.Request(f"http://127.0.0.1:{port}/v1/rerank", data=body,
-                                        headers={"content-type": "application/json"})
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=180)  # fixed host and scheme
             t = time.time()
-            with urllib.request.urlopen(rq, timeout=180) as resp:
-                rr = json.loads(resp.read())
+            conn.request("POST", "/v1/rerank", body=body, headers={"content-type": "application/json"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                sys.exit(f"{cond} request {i}: HTTP {resp.status}")
+            rr = json.loads(resp.read())
+            conn.close()
             ms = (time.time() - t) * 1000
             res[cond].append(ms)
             f.write(json.dumps({"label": label, "cond": cond, "i": i, "id": r["id"], "t0": t, "ms": round(ms),

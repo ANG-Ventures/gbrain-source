@@ -34,6 +34,11 @@ ComfyUI 2 s of every 32 s. Every pause logs one INFO line (`gpu_yield: paused 4.
     deploy/gpu-yield/gpu-yield.sh enable     # copies the node + wrapper, writes two drop-ins, restarts both units
     deploy/gpu-yield/gpu-yield.sh disable    # rollback: removes the drop-ins, restarts both units
 
+`enable` copies `zerank_yield.py` into `~/zerank-serve/` itself. The wrapper imports
+`zerank_server:app` from whichever `zerank_server.py` is already in `~/zerank-serve/`. That file is not on
+master: t_bdc77bdc versions it on branch `daedalus-opus/t_bdc77bdc-zerank-speed` (`deploy/zerank/`). The
+wrapper only needs `app`, so it runs on the live file as it is today and on t_bdc77bdc's version alike.
+
 Both refuse while the live ComfyUI queue is not empty (a restart kills the running job); `--force` overrides.
 The drop-ins are `~/.config/systemd/user/{comfyui,zerank-native}.service.d/60-gpu-yield.conf`; the
 files they point at stay installed after `disable` and do nothing.

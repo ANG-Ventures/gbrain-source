@@ -24,6 +24,13 @@ as the 6 s before its journal completion line). The sibling card's bench was not
 
 Top-3 identical to the idle run's top-3 in every paired comparison (50/50).
 
+## A-2 verdict: not met on the raw numbers
+
+The bar is gate p90 within +25% of the ComfyUI-idle p90 (5682 ms raw, so at most 7103 ms). Run B passes
+raw (6568 ms, +16%). Run F misses raw (7810 ms, +37%). Both pass only after dropping the calls that overlapped
+a live rerank (+12%, +8% against 5333 ms clean). That filter is a post-hoc choice, so A-2 counts as a miss in
+one of two runs. Phase F was not re-measured in a window without live rerank traffic.
+
 ## ComfyUI cost (wall s per job, same workflow; first job after a model load excluded)
 
 | condition | job walls | output vs alone |

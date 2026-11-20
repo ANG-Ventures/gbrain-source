@@ -5,13 +5,12 @@ Job: anima-aesthetic-v1.1 (UNET) + qwen_3_06b text encoder + qwen_image_vae, 128
 30 steps er_sde/simple, cfg 4.0 (the image stage of Ace's animegen workflow). Seed alternates 20261119/20261120
 by job parity so ComfyUI's node cache never skips the sampler; outputs are compared per seed.
 Per job: wall s and sha256 of every output image's decoded pixels (PNG metadata excluded). Runs until <stop_file> exists or max_jobs done."""
-import hashlib, json, os, sys, time, urllib.request, uuid
+import hashlib, http.client, json, os, sys, time, uuid
 
 from PIL import Image
 
-port, label, out, stop = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+port, label, out, stop = int(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
 max_jobs = int(sys.argv[5]) if len(sys.argv) > 5 else 10**6
-base = f"http://127.0.0.1:{port}"
 POS = ("masterpiece, best quality, anime screencap, 2D cel animation, clean line art, flat colors, an adult woman "
        "in a long coat walking through a rainy night market, paper lanterns, wet reflective street, food stalls")
 NEG = "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia, 3d render, cgi, realistic, photo"
@@ -33,9 +32,20 @@ def prompt(tag, seed):
     }
 
 
+def call(method, path, body=None):
+    """JSON call to the ComfyUI instance on 127.0.0.1:<port>; host and scheme are fixed."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    conn.request(method, path, body=body, headers={"content-type": "application/json"} if body else {})
+    r = conn.getresponse()
+    data = r.read()
+    conn.close()
+    if r.status != 200:
+        sys.exit(f"{method} {path}: HTTP {r.status}")
+    return json.loads(data)
+
+
 def get(path):
-    with urllib.request.urlopen(base + path, timeout=30) as r:
-        return json.loads(r.read())
+    return call("GET", path)
 
 
 outdir = os.environ.get("COMFY_OUT", "/home/ace/t_0930e064/comfy/output")
@@ -46,8 +56,7 @@ with open(out, "a") as f:
         seed = 20261119 + (n % 2)
         body = json.dumps({"prompt": prompt(tag, seed), "client_id": str(uuid.uuid4())}).encode()
         t = time.time()
-        rq = urllib.request.Request(base + "/prompt", data=body, headers={"content-type": "application/json"})
-        pid = json.loads(urllib.request.urlopen(rq, timeout=30).read())["prompt_id"]
+        pid = call("POST", "/prompt", body)["prompt_id"]
         while True:
             h = get(f"/history/{pid}")
             if pid in h and h[pid].get("status", {}).get("completed") is not None:
