@@ -81,6 +81,24 @@ class GateTest(unittest.TestCase):
             self.assertGreaterEqual(g.wait(), 0.3)
         self.assertEqual(g.timeouts, 2)
 
+    def test_pause_never_sleeps_past_the_cap(self):
+        """A poll interval longer than the cap must not stretch the pause past max_pause_s."""
+        touch(self.d, "rerank-1-0")
+        clock = [0.0]
+        slept = []
+
+        def sleep(s):
+            slept.append(s)
+            clock[0] += s
+
+        g = gate_mod.Gate(self.d, max_pause_s=1.0, poll_s=0.7, mono=lambda: clock[0], sleep=sleep)
+        g.refresh()
+        with self.assertLogs("gpu_yield", level="WARNING"):
+            waited = g.wait()
+        self.assertAlmostEqual(waited, 1.0)
+        self.assertEqual(len(slept), 2)
+        self.assertAlmostEqual(slept[1], 0.3)
+
     def test_stale_flag_ignored_and_logged_once(self):
         touch(self.d, "rerank-9-9", age_s=120)
         g = self.gate(stale_s=60)
@@ -151,6 +169,37 @@ class ZerankYieldTest(unittest.TestCase):
         self.assertEqual(os.listdir(d), [])
         asyncio.run(m.app({"type": "http", "path": "/health", "method": "GET"}, None, None))
         self.assertEqual(seen[-1], [])  # no flag for non-rerank paths
+
+    def test_existing_file_at_flag_name_not_truncated(self):
+        d = tempfile.mkdtemp()
+
+        async def inner(scope, receive, send):
+            pass
+
+        m = self.load(d, inner)
+        p = os.path.join(d, f"rerank-{os.getpid()}-0")  # the name the first request would use
+        with open(p, "w") as f:
+            f.write("keep")
+        asyncio.run(m.app({"type": "http", "path": "/v1/rerank", "method": "POST"}, None, None))
+        with open(p) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def test_startup_cleanup_keeps_live_writers_flags(self):
+        d = tempfile.mkdtemp()
+        dead = 2 ** 22 + 12345  # above pid_max on Linux and macOS
+        live = touch(d, f"rerank-{os.getppid()}-3")
+        stale = touch(d, f"rerank-{dead}-0")
+        mine = touch(d, f"rerank-{os.getpid()}-9")
+        other = touch(d, "unrelated")
+
+        async def inner(scope, receive, send):
+            pass
+
+        self.load(d, inner)
+        self.assertTrue(os.path.exists(live))
+        self.assertFalse(os.path.exists(stale))
+        self.assertFalse(os.path.exists(mine))
+        self.assertTrue(os.path.exists(other))
 
     def test_off_when_dir_unset(self):
         seen = []

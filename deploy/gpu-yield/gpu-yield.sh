@@ -46,6 +46,10 @@ restart_both() {
   systemctl --user restart zerank-native.service
   for _ in $(seq 1 90); do curl -sf -m2 http://127.0.0.1:8084/health >/dev/null && break; sleep 1; done
   curl -sf -m2 http://127.0.0.1:8084/health >/dev/null || { echo "zerank-native did not come back" >&2; exit 1; }
+  # a job may have been queued while zerank restarted; check again right before the ComfyUI restart.
+  # Refusing here leaves only one side switched, which is inert (flags with no reader, or a gate with no
+  # writer); re-run the same command when the queue is empty.
+  guard
   systemctl --user restart comfyui.service
   for _ in $(seq 1 120); do curl -sf -m2 http://127.0.0.1:8188/system_stats >/dev/null && break; sleep 1; done
   curl -sf -m2 http://127.0.0.1:8188/system_stats >/dev/null || { echo "comfyui did not come back" >&2; exit 1; }

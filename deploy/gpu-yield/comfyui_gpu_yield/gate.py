@@ -90,10 +90,11 @@ class Gate:
         deadline = t0 + self.max_pause_s
         timed_out = False
         while self.busy:
-            if self._mono() >= deadline:
+            left = deadline - self._mono()
+            if left <= 0:
                 timed_out = True
                 break
-            self._sleep(self.poll_s)
+            self._sleep(min(self.poll_s, left))
             if self._thread is None:      # no poller (tests / manual use): scan inline
                 self.refresh()
         waited = self._mono() - t0
