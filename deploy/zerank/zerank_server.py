@@ -5,8 +5,9 @@ sentence-transformers CrossEncoder) on the RTX PRO 6000. Wire shape matches
 gbrain's llama-server-reranker recipe: POST /v1/rerank
 {model, query, documents[]} -> {results: [{index, relevance_score}]}.
 
-Speed knobs (t_bdc77bdc). Rollback to the pre-t_bdc77bdc behaviour:
-  ZERANK_BATCH_SIZE=4 ZERANK_DTYPE=auto ZERANK_EMPTY_CACHE=1 ZERANK_SORT=chars ZERANK_MERGE=0
+Speed knobs (t_bdc77bdc). Rollback to the pre-t_bdc77bdc behaviour: ZERANK_EMPTY_CACHE=1
+(the other knobs default to the old values: ZERANK_BATCH_SIZE=4 ZERANK_DTYPE=auto ZERANK_SORT=chars
+ZERANK_MERGE=0).
 """
 import os
 import threading
@@ -21,8 +22,9 @@ _BATCH_SIZE = int(os.environ.get("ZERANK_BATCH_SIZE", "4"))
 # auto = the weights' own dtype (bf16 for zerank-2); fp16 / bf16 / fp32 force one.
 _DTYPE = os.environ.get("ZERANK_DTYPE", "auto")
 # 1 = gc.collect() + torch.cuda.empty_cache() after every request (the old behaviour).
-# 0 = keep the allocator cache between requests; the OOM path still reclaims.
-_EMPTY_CACHE = os.environ.get("ZERANK_EMPTY_CACHE", "1") == "1"
+# 0 = keep the allocator cache between requests (bit-identical scores, about 5% faster, reserved VRAM
+# stays at the largest pass seen); the OOM path still reclaims. Measured: card t_bdc77bdc.
+_EMPTY_CACHE = os.environ.get("ZERANK_EMPTY_CACHE", "0") == "1"
 # chars = sentence-transformers' own length sort (by characters) inside predict().
 # tokens = sort the pairs by token count first, batch in that order, restore input order.
 _SORT = os.environ.get("ZERANK_SORT", "chars")
