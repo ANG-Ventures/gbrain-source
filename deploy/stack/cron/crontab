@@ -1,0 +1,7 @@
+# deploy/stack/cron/crontab: the ONE schedule for gbrain's scheduled jobs (card t_ab2fcba3). supercronic, TZ from
+# the container env (America/Los_Angeles). Times are the hermes-home cron rows they replace (jobs.json ids
+# 9b1a4fdaaa2a, a3bcde3fa92e, 7d0b9686f64e). `tick` runs nothing until /state/ARMED exists (the operator arms it in
+# the cutover, after disabling those rows). tests/test_stack.py asserts this file equals gbrainjob's JOBS table.
+30 3 * * *   gbrainjob tick nightly-sync
+15 4 * * *   gbrainjob tick pg-backup
+50 9 * * *   gbrainjob tick deploy-parity

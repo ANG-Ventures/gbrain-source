@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""gbrainjob: the ONE entrypoint for every gbrain scheduled job (card t_ab2fcba3; mem0job's shape, smaller).
+
+  gbrainjob serve                 PID-1 child of the cron container: take the stack's instance lock in the DB
+                                  (pg_try_advisory_lock), then run supercronic on /etc/gbrain/crontab. A second cron
+                                  container against the same database exits 1 instead of running jobs twice.
+  gbrainjob run <job> [args]      run now (operator / proof); always executes
+  gbrainjob tick <job>            what the crontab calls: skipped (no result line) until $STATE/ARMED exists, so a
+                                  stack brought up beside the launchd jobs runs nothing until the operator arms it
+  gbrainjob list                  the job table
+  gbrainjob show [<job>]          the latest result line(s)
+
+Each job is jobs/<job>.sh. It logs normally and may end with one stdout line `EFFECT {json}`. The dispatcher holds
+a per-job flock (a tick that fires during a run is skipped) and a per-job DB advisory lock for the run, then writes
+$STATE/results/<job>.json and appends $STATE/results/<job>.jsonl, and mirrors both into $GBRAIN_RECEIPTS_DIR (a
+host bind mount) when it is set, where the host watch reads them:
+
+  {"job", "started", "ended", "rc", "result": "ok"|"fail", "effect": {...}, "tail": [...], "host", "revision"}
+
+The container never pages by itself: a failed result line is what the host-side watch turns into an #alerts page.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import zlib
+from pathlib import Path
+
+STATE = Path(os.environ.get("GBRAIN_STATE_DIR", "/state"))
+JOBS_DIR = Path(os.environ.get("GBRAIN_JOBS_DIR", "/opt/gbrain-cron/jobs"))
+CRONTAB = Path(os.environ.get("GBRAIN_CRONTAB", "/etc/gbrain/crontab"))
+TAIL_LINES = 12
+TERM_GRACE_S = 60
+INSTANCE_LOCK = "gbrain-cron-instance"
+
+# job -> schedule (must equal the crontab line; tests/test_stack.py asserts it), timeout seconds.
+JOBS = {
+    "nightly-sync":  {"cron": "30 3 * * *", "timeout": 3600},
+    "pg-backup":     {"cron": "15 4 * * *", "timeout": 4 * 3600 + 600},
+    "deploy-parity": {"cron": "50 9 * * *", "timeout": 300},
+}
+
+
+def now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def lock_key(name: str) -> int:
+    """A stable signed 32-bit key for pg_advisory_lock(int, int) namespace 7271 (gbrain)."""
+    return zlib.crc32(name.encode()) & 0x7FFFFFFF
+
+
+class DbLock:
+    """Hold a session advisory lock for as long as this object lives, through a psql coprocess (connection from
+    PGHOST/PGPORT/PGUSER/PGDATABASE/PGPASSFILE). acquire() -> True | False (held elsewhere) | None (DB unreachable)."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.proc: subprocess.Popen | None = None
+
+    def acquire(self, timeout: float = 30.0):
+        try:
+            self.proc = subprocess.Popen(["psql", "-X", "-qtA", "-v", "ON_ERROR_STOP=1"], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except OSError:
+            return None
+        assert self.proc.stdin and self.proc.stdout
+        self.proc.stdin.write(f"select pg_try_advisory_lock(7271, {lock_key(self.name)});\n")
+        self.proc.stdin.flush()
+        import select
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        line = self.proc.stdout.readline().strip() if r else ""
+        if line == "t":
+            return True
+        self.release()
+        return False if line == "f" else None
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def release(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.stdin.write("\\q\n")
+                self.proc.stdin.flush()
+                self.proc.wait(5)
+            except Exception:
+                self.proc.kill()
+        self.proc = None
+
+
+def write_result(job: str, rec: dict) -> None:
+    line = json.dumps(rec, sort_keys=True)
+    dirs = [STATE / "results"]
+    if os.environ.get("GBRAIN_RECEIPTS_DIR"):
+        dirs.append(Path(os.environ["GBRAIN_RECEIPTS_DIR"]))
+    for d in dirs:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / f".{job}.json.tmp"
+            tmp.write_text(line + "\n")
+            os.replace(tmp, d / f"{job}.json")
+            with open(d / f"{job}.jsonl", "a") as f:
+                f.write(line + "\n")
+        except OSError as e:
+            print(f"gbrainjob: could not write result to {d}: {e}", file=sys.stderr)
+
+
+def run(job: str, args: list[str]) -> int:
+    if job not in JOBS:
+        print(f"gbrainjob: unknown job {job!r} (jobs: {', '.join(JOBS)})", file=sys.stderr)
+        return 64
+    script = JOBS_DIR / f"{job}.sh"
+    (STATE / "locks").mkdir(parents=True, exist_ok=True)
+    lf = open(STATE / "locks" / f"{job}.lock", "w")
+    try:
+        fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"gbrainjob: {job} already running here; skipped")
+        return 0
+    db = DbLock(f"job:{job}")
+    got = db.acquire()
+    if got is False:
+        print(f"gbrainjob: {job} is running against this database from another container; skipped")
+        return 0
+    started = now_iso()
+    t0 = time.monotonic()
+    tail: list[str] = []
+    effect: dict = {}
+    if got is None:
+        rc, tail = 1, ["gbrainjob: database unreachable for the job lock"]
+    else:
+        proc = subprocess.Popen(["bash", str(script), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, start_new_session=True)
+        deadline = time.monotonic() + JOBS[job]["timeout"]
+
+        def on_alarm(*_):
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                time.sleep(TERM_GRACE_S)
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(max(1, int(deadline - time.monotonic())))
+        assert proc.stdout
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            print(line, flush=True)
+            if line.startswith("EFFECT "):
+                try:
+                    effect = json.loads(line[7:])
+                except ValueError:
+                    pass
+            tail = (tail + [line])[-TAIL_LINES:]
+        rc = proc.wait()
+        signal.alarm(0)
+    db.release()
+    rec = {"job": job, "started": started, "ended": now_iso(), "secs": round(time.monotonic() - t0, 1), "rc": rc,
+           "result": "ok" if rc == 0 else "fail", "effect": effect, "tail": tail,
+           "host": os.environ.get("GBRAIN_HOST_NAME", socket.gethostname()),
+           "revision": os.environ.get("GBRAIN_REVISION", "unknown")}
+    write_result(job, rec)
+    print(f"GBRAINJOB job={job} result={rec['result']} rc={rc} secs={rec['secs']}")
+    return rc
+
+
+def tick(job: str) -> int:
+    if not (STATE / "ARMED").exists():
+        return 0
+    return run(job, [])
+
+
+def serve() -> int:
+    inst = DbLock(INSTANCE_LOCK)
+    for attempt in range(30):          # postgres may still be starting
+        got = inst.acquire()
+        if got is not None:
+            break
+        time.sleep(10)
+    if got is not True:
+        print("gbrainjob serve: another gbrain cron container holds this database's instance lock"
+              if got is False else "gbrainjob serve: database unreachable", file=sys.stderr)
+        return 1
+    print(f"gbrainjob serve: instance lock held; armed={(STATE / 'ARMED').exists()}; crontab={CRONTAB}", flush=True)
+    child = subprocess.Popen(["supercronic", "-passthrough-logs", str(CRONTAB)])
+    stopping = False
+
+    def stop(signum, _f):
+        nonlocal stopping
+        stopping = True
+        if child.poll() is None:
+            child.send_signal(signum)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, stop)
+    while not stopping and child.poll() is None and inst.alive():
+        time.sleep(1)
+    if child.poll() is None:
+        child.terminate()
+        child.wait()
+    inst.release()
+    return 0 if stopping else 1          # an unexpected exit restarts the container
+
+
+def show(job: str | None) -> int:
+    for j in ([job] if job else JOBS):
+        p = STATE / "results" / f"{j}.json"
+        print(p.read_text().strip() if p.exists() else json.dumps({"job": j, "result": "never"}))
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(__doc__)
+        return 64
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "serve":
+        return serve()
+    if cmd == "run" and rest:
+        return run(rest[0], rest[1:])
+    if cmd == "tick" and len(rest) == 1:
+        return tick(rest[0])
+    if cmd == "list":
+        for j, spec in JOBS.items():
+            print(f"{j}\t{spec['cron']}\ttimeout={spec['timeout']}s")
+        return 0
+    if cmd == "show":
+        return show(rest[0] if rest else None)
+    print(__doc__)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

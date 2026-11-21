@@ -1,0 +1,4 @@
+#!/bin/sh
+# The gbrain CLI inside the cron container: the server image's entrypoint (secrets -> env, config.json -> GBRAIN_HOME)
+# then `bun /app/src/cli.ts "$@"`. The jobs call it as `gbrain import ...`, `gbrain extract-links`.
+exec /usr/local/bin/gbrain-entrypoint "$@"
