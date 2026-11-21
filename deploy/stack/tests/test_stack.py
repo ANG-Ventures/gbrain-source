@@ -591,6 +591,21 @@ def test_watch_pages_each_failure_once(watch, capsys):
     assert rc == 1 and "rerank-tunnel NOT RUNNING" in out
 
 
+def test_watch_state_write_does_not_follow_a_planted_symlink(watch, tmp_path):
+    """Prism 110df17353ff: the receipts dir is container-writable, so a symlink planted at a predictable temp path
+    must not be written through."""
+    mod, _, rd = watch
+    rd.mkdir()
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    state = rd / mod.STATE_FILE
+    (rd / (mod.STATE_FILE + ".tmp")).symlink_to(victim)
+    mod.page_new([("k", "t")], state)
+    assert victim.read_text() == "keep\n"
+    assert json.loads(state.read_text())["open"] == ["k"] and not state.is_symlink()
+    assert sorted(p.name for p in rd.iterdir()) == sorted([mod.STATE_FILE, mod.STATE_FILE + ".tmp"])
+
+
 # ---- t_d3252f19 fix 5: pg-backup fails a dump below 80% of the last good run's processed bytes ------------------
 FAKE_RESTIC = """#!/bin/sh
 d=$(dirname "$0")

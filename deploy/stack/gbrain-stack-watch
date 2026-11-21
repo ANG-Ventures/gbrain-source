@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.parse
@@ -76,9 +77,15 @@ def page_new(findings: list[tuple[str, str]], state: Path) -> list[str]:
     keys = [k for k, _ in findings]
     try:
         state.parent.mkdir(parents=True, exist_ok=True)
-        tmp = state.with_name(state.name + ".tmp")
-        tmp.write_text(json.dumps({"open": keys, "at": int(time.time())}) + "\n")
-        os.replace(tmp, state)
+        # receipts dir is container-writable: an exclusive, randomly named temp (O_EXCL, no symlink follow)
+        fd, tmp = tempfile.mkstemp(prefix=state.name + ".", suffix=".tmp", dir=state.parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({"open": keys, "at": int(time.time())}) + "\n")
+            os.replace(tmp, state)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
     except OSError as e:          # cannot dedupe: page everything rather than go quiet
         return [t for _, t in findings] + [f"stack-watch state {state} not writable ({type(e).__name__}): "
                                            "every finding pages each run"]
