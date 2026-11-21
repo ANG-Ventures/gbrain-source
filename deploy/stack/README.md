@@ -57,7 +57,25 @@ advisory lock for the run, so `gbrainjob run` from a second container skips.
 21:56 to 22:01 PT, 29 GB), brain repo = an APFS clone (`cp -c -R`, 20 s) mounted at the live path so
 `ingest_log.source_ref` matches, scratch restic repo. Images built on the Studio by `gbrainctl build` from
 `99aa9fca` (= master `9bd1cfeb` + `deploy/stack` only; `git diff 9bd1cfeb 99aa9fca -- . ':!deploy/stack'` is empty).
-Numbers are in the card's handback.
+Final images: `422c0550` (same app code). Measured 2026-11-20 22:02-23:05 PT:
+
+| check | result |
+|---|---|
+| same answers, `search` limit 5, 20 real recent Discord turns (what the mem0 prefetch sends) | 20/20 identical slug#chunk_id lists and order, live vs proof; live vs live 20/20 |
+| same, with the proof's `query_cache` emptied (62,204 rows -> 0) so every proof search is computed fresh (1.1-5.7 s each), final images | 20/20 identical |
+| a second set of 20 newer turns | 20/20 identical |
+| health | server `/health` `{"status":"ok","engine":"postgres"}`, rerank-proxy `primary_ok: true`, `gbrainctl status` STATUS=ok |
+| nightly-sync, once (99aa9fca image) | ok, 10 roots, 84 pages updated, brain clone committed; 1,560 s, of which ~20 min was one `git add -A` re-hashing an APFS clone whose mtimes all changed (proof artefact; see the git stat row) |
+| pg-backup, once, into a scratch restic repo | ok, 30.05 GB plain SQL in 196 s (cron at 2 cpus for the run), `restic dump` header `Dumped from 16.14 / by pg_dump 16.16` |
+| deploy-parity, once | ok; with a wrong pin it fails naming both revisions |
+| one cron per database | a second cron container exits 1 `another gbrain cron container holds this database's instance lock`; after a DB restart the cron container exits within 30 s and re-takes the lock (RestartCount 1) |
+| git over the bind mount (live repo, read-only, `--no-optional-locks`) | container default stat checks 481 s, container `core.checkStat=minimal` 14 s, host native 3 s |
+| downtime of a stop -> new containers -> up cycle (proof) | stop to `/health` ok 15.5 s, to first answered search 15.9 s (12.7 s of it is `up`, mostly the postgres healthcheck interval) |
+
+Cores and memory, 60 searches per side (20 new turns + 40 repeats), same moment, live = launchd processes, proof =
+containers (cgroup): server 3.98 vs 3.16 CPU-s, rerank proxy 0.22 vs 0.08 CPU-s, server memory 364 MiB RSS vs
+206 MiB, postgres CPU 6.3 % vs 4.5 % avg (docker stats), postgres memory 3.6 GiB vs 2.2 GiB (the proof's
+shared_buffers were colder).
 
 ## Before the cutover (operator, no downtime)
 
@@ -77,7 +95,12 @@ Numbers are in the card's handback.
    cd ~/gbrain-stack-live/deploy/stack && python3.14 ./gbrainctl build --host studio && python3.14 ./gbrainctl render --host studio
    ```
 
-## Cutover (operator window; measured downtime in the handback)
+## Cutover (operator window: expect 15-30 s without gbrain)
+
+The proof's stop -> up cycle took 15.5 s to `/health`. Production adds the shutdown checkpoint of the live
+`gbrain-pg` (6 GB shared_buffers; the proof copy's took 0.7 s with a cold cache) and one render through
+op-cached-read. Callers degrade, they do not fail: the mem0 prefetch's gbrain leg times out to `[]` for the turns in
+that window, `rail.sh` falls back to the cold CLI (which needs postgres, so it fails for those seconds).
 
 ```
 cd ~/gbrain-stack-live/deploy/stack
