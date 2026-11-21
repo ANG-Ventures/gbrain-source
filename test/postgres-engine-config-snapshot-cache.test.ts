@@ -8,7 +8,8 @@
  */
 
 import { describe, it, expect, afterEach } from 'bun:test';
-import { PostgresEngine, configSnapshotTtlMs } from '../src/core/postgres-engine.ts';
+import { PostgresEngine } from '../src/core/postgres-engine.ts';
+import { configSnapshotTtlMs } from '../src/core/postgres-engine/config-snapshot-cache.ts';
 
 function makeEngine() {
   const table: Record<string, string> = { a: '1', b: '2' };
