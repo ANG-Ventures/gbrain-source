@@ -12,16 +12,24 @@ The checks that need the docker socket or the host's GitHub credentials, i.e. wh
   3. no stack container bind-mounts application code (the old live-checkout coupling): the only binds allowed are
      the brain repo, the receipts dir and the backup stamp dir
   4. server /health on the published port says engine=postgres; rerank-proxy /health says primary_ok=true (false =
-     the DeepInfra fallback is engaged: the page the launchd proxy sent itself through ~/.hermes/scripts/notify)
-  5. each cron job's latest result line in <receipts_dir>/<job>.json is ok and not older than its period + grace
+     the DeepInfra fallback is engaged) and fallback_armed=true (false = no DeepInfra key: a primary outage is a 502)
+  5. rerank-proxy's last hour of logs (the pages the launchd proxy sent itself through ~/.hermes/scripts/notify go
+     to /bin/true in the stack): fallback-or-failed requests >= FALLBACK_MIN and >= FALLBACK_PCT % of all requests,
+     and any DeepInfra 401/402 (key rejected / out of funds)
+  6. rerank-tunnel runs when the host profile has rerank_tunnel = true
+  7. each cron job's latest result line in <receipts_dir>/<job>.json is ok and not older than its period + grace
      (only once the stack is armed: <receipts_dir>/ARMED-AT exists, written by the cutover)
-Silent + exit 0 when green. Findings on stdout + exit 1 (a no_agent cron row delivers stdout to #alerts).
+Pages once per episode: each finding has a key (a failed cron result's key carries its `ended`), the keys still open
+are kept in <receipts_dir>/stack-watch-state.json, and only keys not open on the previous run are printed. A finding
+that clears and comes back pages again. Silent + exit 0 when nothing is new; new findings on stdout + exit 1 (a
+no_agent cron row delivers stdout to #alerts).
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -32,11 +40,49 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PERIOD_GRACE_S = {"nightly-sync": 86400 + 6 * 3600, "pg-backup": 86400 + 6 * 3600, "deploy-parity": 86400 + 6 * 3600}
+FALLBACK_MIN = 3        # rerank requests in the last hour served by DeepInfra or by nobody, before it pages ...
+FALLBACK_PCT = 10       # ... and their share of all rerank requests in that hour
+STATE_FILE = "stack-watch-state.json"
 
 
-def sh(*cmd, timeout=30):
-    r = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+def sh(*cmd, timeout=30, merge=False):
+    r = subprocess.run(list(cmd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+                       text=True, timeout=timeout)
     return r.returncode, r.stdout.strip()
+
+
+def rerank_log_findings(log: str) -> list[tuple[str, str]]:
+    """Findings from the rerank-proxy's log lines (its `req ... via=<primary|fallback|none>` access line per request
+    and its `fallback ALSO failed: HTTP <code>` line)."""
+    via = re.findall(r"\[rerank-proxy\] req .* via=(primary|fallback|none) ", log)
+    bad = sum(1 for v in via if v != "primary")
+    out = []
+    if bad >= FALLBACK_MIN and bad * 100 >= FALLBACK_PCT * len(via):
+        out.append(("rerank-fallback-share", f"rerank: {bad} of {len(via)} requests in the last hour ran on the "
+                    "DeepInfra fallback or failed (local zerank-2 primary not answering /v1/rerank)"))
+    for code in sorted(set(re.findall(r"fallback ALSO failed: HTTP (40[12])\b", log))):
+        what = "OUT OF FUNDS (top up: https://deepinfra.com/dash/billing)" if code == "402" else "rejected the key"
+        out.append((f"deepinfra-{code}", f"rerank: DeepInfra answered HTTP {code}: {what}; with the primary down "
+                    "searches are un-reranked"))
+    return out
+
+
+def page_new(findings: list[tuple[str, str]], state: Path) -> list[str]:
+    """The texts of the findings whose key was not open on the previous run; records the keys open now."""
+    try:
+        prev = set(json.loads(state.read_text()).get("open", []))
+    except (OSError, ValueError, AttributeError):
+        prev = set()
+    keys = [k for k, _ in findings]
+    try:
+        state.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state.with_name(state.name + ".tmp")
+        tmp.write_text(json.dumps({"open": keys, "at": int(time.time())}) + "\n")
+        os.replace(tmp, state)
+    except OSError as e:          # cannot dedupe: page everything rather than go quiet
+        return [t for _, t in findings] + [f"stack-watch state {state} not writable ({type(e).__name__}): "
+                                           "every finding pages each run"]
+    return [t for k, t in findings if k not in prev]
 
 
 def get_json(url, timeout=8):
@@ -48,57 +94,73 @@ def get_json(url, timeout=8):
         return json.load(r)
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
     ap.add_argument("--no-github", action="store_true")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     h = tomllib.loads((HERE / "hosts" / f"{a.host}.toml").read_text())
     proj, pin = h["compose_project"], h["revision"]
-    out: list[str] = []
+    found: list[tuple[str, str]] = []
+
+    def add(key: str, text: str):
+        found.append((key, text))
+
     rc, names = sh("docker", "ps", "--filter", f"label=com.docker.compose.project={proj}", "--format", "{{.Names}}")
-    running = names.split() if rc == 0 else []
     if rc != 0:
-        out.append("docker ps failed: the stack is BLIND")
-    for svc in ("postgres", "server", "rerank-proxy", "cron"):
+        add("docker-ps", "docker ps failed: the stack is BLIND")
+    cids: dict[str, str] = {}
+    for svc in ("postgres", "server", "rerank-proxy", "cron") + (("rerank-tunnel",) if h.get("rerank_tunnel") else ()):
         rc, ids = sh("docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={proj}",
                      "--filter", f"label=com.docker.compose.service={svc}")
         if not ids:
-            out.append(f"service {svc} NOT RUNNING in project {proj}")
+            add(f"down:{svc}", f"service {svc} NOT RUNNING in project {proj}")
             continue
-        cid = ids.split()[0]
+        cid = cids[svc] = ids.split()[0]
         _, info = sh("docker", "inspect", cid, "--format",
                      '{{index .Config.Labels "org.opencontainers.image.revision"}}|{{json .Mounts}}')
         lab, _, mounts = info.partition("|")
         if svc != "postgres" and lab != pin:
-            out.append(f"{svc} runs revision {lab or '-'} != pinned {pin[:12]} (gbrainctl build + up)")
+            add(f"revision:{svc}:{lab}",
+                f"{svc} runs revision {lab or '-'} != pinned {pin[:12]} (gbrainctl build + up)")
         allowed = {"/receipts", "/backup-stamps", f"{os.path.expanduser(h['gbrain_home'])}/brain"}
         for m in json.loads(mounts or "[]"):
             if m.get("Type") == "bind" and m.get("Destination") not in allowed and not m.get(
                     "Destination", "").startswith("/run/secrets"):
-                out.append(f"{svc} bind-mounts {m.get('Source')} -> {m.get('Destination')} (no code mounts)")
+                add(f"bind:{svc}:{m.get('Destination')}",
+                    f"{svc} bind-mounts {m.get('Source')} -> {m.get('Destination')} (no code mounts)")
     if not a.no_github:
         rc, ls = sh("git", "ls-remote", "https://github.com/ANG-Ventures/gbrain-source.git", "refs/heads/master",
                     timeout=60)
         master = ls.split()[0] if rc == 0 and ls else ""
         if not master:
-            out.append("git ls-remote gbrain-source master FAILED: parity unknown")
+            add("ls-remote", "git ls-remote gbrain-source master FAILED: parity unknown")
         elif master != pin:
-            out.append(f"pin {pin[:12]} != gbrain-source master {master[:12]}: land a hosts/{a.host}.toml pin PR, "
-                       f"gbrainctl build, gbrainctl up")
+            add(f"parity:{master}", f"pin {pin[:12]} != gbrain-source master {master[:12]}: land a "
+                f"hosts/{a.host}.toml pin PR, gbrainctl build, gbrainctl up")
     try:
         hj = get_json(f"http://127.0.0.1:{h['ports']['serve']}/health")
         if hj.get("engine") != "postgres" or hj.get("status") != "ok":
-            out.append(f"server /health not ok: {json.dumps(hj)[:200]}")
+            add("server-health", f"server /health not ok: {json.dumps(hj)[:200]}")
     except Exception as e:
-        out.append(f"server /health no answer: {type(e).__name__}")
+        add("server-health", f"server /health no answer: {type(e).__name__}")
     try:
         rj = get_json(f"http://127.0.0.1:{h['ports']['rerank']}/health")
+        if not rj.get("fallback_armed"):
+            add("rerank-unarmed", "rerank fallback NOT armed (no DeepInfra key in the proxy): a primary outage "
+                "means un-reranked search; check secrets/deepinfra-key and re-render")
         if not rj.get("primary_ok"):
-            out.append("rerank primary (zerank-2 on the reranker host) unreachable: searches run on the DeepInfra "
-                       f"fallback (fallback_armed={rj.get('fallback_armed')}); check zerank-native + rerank-tunnel")
+            add("rerank-primary", "rerank primary (zerank-2 on the reranker host) unreachable: searches run on "
+                f"the DeepInfra fallback (fallback_armed={rj.get('fallback_armed')}); check zerank-native + "
+                "rerank-tunnel")
     except Exception as e:
-        out.append(f"rerank-proxy /health no answer: {type(e).__name__}")
+        add("rerank-health", f"rerank-proxy /health no answer: {type(e).__name__}")
+    if "rerank-proxy" in cids:
+        rc, log = sh("docker", "logs", "--since", "1h", cids["rerank-proxy"], merge=True, timeout=60)
+        if rc != 0:
+            add("rerank-logs", "docker logs rerank-proxy failed: fallback use unknown")
+        else:
+            found.extend(rerank_log_findings(log))
     rd = Path(os.path.expanduser(h["receipts_dir"]))
     if (rd / "ARMED-AT").exists():
         armed = (rd / "ARMED-AT").stat().st_mtime
@@ -106,14 +168,16 @@ def main() -> int:
             p = rd / f"{job}.json"
             if not p.exists():
                 if time.time() - armed > grace:
-                    out.append(f"cron job {job}: no result since the stack was armed")
+                    add(f"cron-none:{job}", f"cron job {job}: no result since the stack was armed")
                 continue
             r = json.loads(p.read_text())
             if r.get("result") != "ok":
-                out.append(f"cron job {job} {r.get('result')} rc={r.get('rc')} at {r.get('ended')}: "
-                           + " | ".join((r.get("tail") or [])[-3:])[:400])
+                add(f"cron-fail:{job}:{r.get('ended')}",
+                    f"cron job {job} {r.get('result')} rc={r.get('rc')} at {r.get('ended')}: "
+                    + " | ".join((r.get("tail") or [])[-3:])[:400])
             elif time.time() - p.stat().st_mtime > grace:
-                out.append(f"cron job {job}: last ok result is older than {grace // 3600} h")
+                add(f"cron-stale:{job}", f"cron job {job}: last ok result is older than {grace // 3600} h")
+    out = page_new(found, rd / STATE_FILE)
     if not out:
         return 0
     print(f"⚠️ gbrain stack {proj} ({time.strftime('%Y-%m-%d %H:%M %Z')}):")

@@ -197,7 +197,7 @@ def prod_stack(tmp_path, monkeypatch):
     hf.write_text(h)
     stack = tmp_path / "stack"
     stack.mkdir()
-    (stack / ".env").write_text("# RENDERED by gbrainctl abc schema=def from hosts/studio.toml; do not edit\n")
+    (stack / ".env").write_text("# RENDERED by gbrainctl abc schema=def from hosts/studio-proof.toml; do not edit\n")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     (bindir / "docker").write_text(FAKE_DOCKER)
@@ -432,3 +432,208 @@ def test_nightly_commit_advances_stamp(tmp_path):
     r, mtime = _night(tmp_path, lock_index=False)
     assert r.returncode == 0 and '"brain_committed": 1' in r.stdout, r.stdout + r.stderr
     assert mtime > 1_000_000
+
+
+# ---- t_d3252f19 fix 1: a .env rendered for another host is refused (compose/up/down/status, and render over it) --
+OTHER_HEADER = "# RENDERED by gbrainctl abc schema=def from hosts/studio.toml; do not edit\n"
+
+
+@pytest.mark.parametrize("argv", [["compose", "--", "ps"], ["compose", "--", "up"], ["down"], ["status"]])
+def test_compose_verbs_refuse_env_rendered_for_another_host(prod_stack, capsys, argv):
+    _, stack, log = prod_stack
+    (stack / ".env").write_text(OTHER_HEADER)                  # the prod stack dir; the host below is studio-proof
+    with pytest.raises(SystemExit) as e:
+        gbrainctl.main([argv[0], "--host-file", str(STACK / "hosts" / "studio-proof.toml"), "--stack-dir", str(stack)]
+                       + argv[1:])
+    assert e.value.code == 3
+    assert "was rendered for host 'studio'" in capsys.readouterr().err
+    assert not log.exists()                                    # docker never ran
+
+
+def test_render_refuses_to_overwrite_another_hosts_env(tmp_path, fake_op, capsys):
+    stack = tmp_path / "prod"
+    stack.mkdir()
+    (stack / ".env").write_text(OTHER_HEADER + "GBRAIN_PG_CONTAINER=gbrain-pg\n")
+    (stack / "secrets").mkdir()
+    (stack / "secrets" / "openai-key").write_text("PROD")
+    with pytest.raises(SystemExit) as e:
+        render("studio-proof", stack, capsys)
+    assert e.value.code == 2
+    assert "was rendered for host 'studio'" in capsys.readouterr().err
+    assert (stack / ".env").read_text() == OTHER_HEADER + "GBRAIN_PG_CONTAINER=gbrain-pg\n"
+    assert (stack / "secrets" / "openai-key").read_text() == "PROD"
+    rc, out = render("studio-proof", tmp_path / "proof", capsys)   # its own (or an empty) stack dir still renders
+    assert rc == 0 and "RENDER=ok host=studio-proof" in out.out
+    rc, out = render("studio-proof", tmp_path / "proof", capsys)
+    assert rc == 0 and "changed=0" in out.out
+
+
+# ---- t_d3252f19 fixes 2 + 3: the runbook's restart-policy step and the rollback readbacks ------------------------
+def _readme_section(title: str) -> str:
+    text = (STACK / "README.md").read_text()
+    return text.split(f"## {title}", 1)[1].split("\n## ", 1)[0]
+
+
+def test_cutover_sets_old_pg_restart_policy_to_no_before_the_stop():
+    cut = _readme_section("Cutover")
+    upd = cut.index("docker update --restart=no gbrain-pg")
+    readback = cut.index("docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gbrain-pg", upd)
+    assert upd < readback < cut.index("docker stop -t 60 gbrain-pg")
+    rb = _readme_section("Rollback")
+    assert "docker update --restart=unless-stopped gbrain-pg" in rb
+    assert rb.index("--restart=unless-stopped") < rb.index("RestartPolicy.Name")
+
+
+def test_rollback_pauses_the_watch_first_and_reads_back_every_step():
+    rb = _readme_section("Rollback")
+    pause = rb.index("hermes cron pause <gbrain-stack-watch row>")
+    assert pause < rb.index("gbrainctl down")
+    for readback in ("label=com.docker.compose.project=gbrain", "pg_isready", "127.0.0.1 5433",
+                     "launchctl print gui/$U/$l", "http://127.0.0.1:8199/health", "http://127.0.0.1:18085/health"):
+        assert readback in rb, readback
+    resume = rb.index("hermes cron resume 9b1a4fdaaa2a")
+    last = rb[resume:]
+    assert "hermes cron list" in last and all(i in last.split("hermes cron list", 1)[1]
+                                               for i in ("9b1a4fdaaa2a", "a3bcde3fa92e", "7d0b9686f64e"))
+
+
+# ---- t_d3252f19 fix 4: the watch pages fallback use, DeepInfra 401/402 and a dead tunnel, once per episode -------
+def _req(via: str) -> str:
+    return f"[rerank-proxy] req 10:00:00 caller=? ua=- docs=5 top_n=3 q_len=4 q_sent=4 q=abcd1234 via={via} code=200 ms=9\n"
+
+
+@pytest.fixture()
+def watch(tmp_path, monkeypatch):
+    """gbrain-stack-watch with a host file in tmp, a fake docker (sh) and fake /health (get_json)."""
+    mod = load("gbrain_stack_watch", STACK / "gbrain-stack-watch")
+    (tmp_path / "hosts").mkdir()
+    rd = tmp_path / "receipts"
+    (tmp_path / "hosts" / "t.toml").write_text(
+        f'compose_project = "gbrain"\nrevision = "{"a" * 40}"\ngbrain_home = "{tmp_path}"\n'
+        f'receipts_dir = "{rd}"\nrerank_tunnel = true\nports = {{ serve = 1, rerank = 2 }}\n')
+    monkeypatch.setattr(mod, "HERE", tmp_path)
+    st = {"down": set(), "log": "", "health": {"status": "ok", "primary_ok": True, "fallback_armed": True}}
+
+    def sh(*cmd, timeout=30, merge=False):
+        if cmd[:2] == ("docker", "ps") and "-q" in cmd:
+            svc = cmd[-1].rsplit("=", 1)[1]
+            return 0, "" if svc in st["down"] else f"cid-{svc}"
+        if cmd[:2] == ("docker", "inspect"):
+            return 0, "a" * 40 + "|[]"
+        if cmd[:2] == ("docker", "logs"):
+            return 0, st["log"]
+        return 0, ""
+
+    def get_json(url, timeout=8):
+        return {"engine": "postgres", "status": "ok"} if url.endswith(":1/health") else st["health"]
+
+    monkeypatch.setattr(mod, "sh", sh)
+    monkeypatch.setattr(mod, "get_json", get_json)
+    return mod, st, rd
+
+
+def _run_watch(mod, capsys):
+    rc = mod.main(["--host", "t", "--no-github"])
+    return rc, capsys.readouterr().out
+
+
+def test_watch_green_is_silent(watch, capsys):
+    mod, st, _ = watch
+    st["log"] = _req("primary") * 50 + _req("fallback")       # 1 of 51: below the threshold
+    assert _run_watch(mod, capsys) == (0, "")
+
+
+def test_watch_checks_the_tunnel_when_the_profile_is_on(watch, capsys):
+    mod, st, _ = watch
+    st["down"].add("rerank-tunnel")
+    rc, out = _run_watch(mod, capsys)
+    assert rc == 1 and "service rerank-tunnel NOT RUNNING" in out
+
+
+@pytest.mark.parametrize("log,expect", [
+    (_req("primary") * 10 + _req("fallback") * 3, "3 of 13 requests"),
+    (_req("none") + "[rerank-proxy] fallback ALSO failed: HTTP 402\n", "HTTP 402: OUT OF FUNDS"),
+    ("[rerank-proxy] fallback ALSO failed: HTTP 401\n", "HTTP 401: rejected the key"),
+])
+def test_watch_pages_fallback_use_and_deepinfra_auth(watch, capsys, log, expect):
+    mod, st, _ = watch
+    st["log"] = log
+    rc, out = _run_watch(mod, capsys)
+    assert rc == 1 and expect in out, out
+
+
+def test_watch_pages_unarmed_fallback(watch, capsys):
+    mod, st, _ = watch
+    st["health"] = {"status": "ok", "primary_ok": True, "fallback_armed": False}
+    rc, out = _run_watch(mod, capsys)
+    assert rc == 1 and "fallback NOT armed" in out
+
+
+def test_watch_pages_each_failure_once(watch, capsys):
+    mod, st, rd = watch
+    rd.mkdir()
+    (rd / "ARMED-AT").write_text("")
+    for job in mod.PERIOD_GRACE_S:
+        (rd / f"{job}.json").write_text(json.dumps({"result": "ok"}))
+    fail = {"result": "fail", "rc": 1, "ended": "2026-11-21T03:30:00", "tail": ["boom"]}
+    (rd / "pg-backup.json").write_text(json.dumps(fail))
+    st["down"].add("rerank-tunnel")
+    rc, out = _run_watch(mod, capsys)
+    assert rc == 1 and "cron job pg-backup fail" in out and "rerank-tunnel NOT RUNNING" in out
+    assert _run_watch(mod, capsys) == (0, "")                  # the same failures an hour later: no repeat
+    (rd / "pg-backup.json").write_text(json.dumps({**fail, "ended": "2026-11-22T03:30:00"}))
+    rc, out = _run_watch(mod, capsys)                          # a new failed run pages, the open tunnel does not
+    assert rc == 1 and "2026-11-22T03:30:00" in out and "rerank-tunnel" not in out
+    st["down"].clear()
+    assert _run_watch(mod, capsys) == (0, "")                  # tunnel back: the episode closes
+    st["down"].add("rerank-tunnel")
+    rc, out = _run_watch(mod, capsys)                          # and a new episode pages again
+    assert rc == 1 and "rerank-tunnel NOT RUNNING" in out
+
+
+# ---- t_d3252f19 fix 5: pg-backup fails a dump below 80% of the last good run's processed bytes ------------------
+FAKE_RESTIC = """#!/bin/sh
+d=$(dirname "$0")
+echo "$*" >> "$d/restic.log"
+case "$*" in
+  *backup*) printf '{"message_type":"summary","snapshot_id":"abcdef0123456789","total_bytes_processed":%s,"data_added":5}\\n' "$(cat "$d/proc")" ;;
+esac
+exit 0
+"""
+
+
+def _backup(tmp_path, proc: int, prev: int | None):
+    bindir, stamps, st = tmp_path / "bin", tmp_path / "stamps", tmp_path / "state"
+    for d in (bindir, stamps, st):
+        d.mkdir(exist_ok=True)
+    (bindir / "restic").write_text(FAKE_RESTIC)
+    (bindir / "restic").chmod(0o755)
+    (bindir / "proc").write_text(str(proc))
+    (tmp_path / "pw").write_text("pw")
+    stamp = stamps / "last-success-gbrain-pg-backup"
+    if prev is not None:
+        stamp.write_text(f"1700000000 snapshot=00000000 processed={prev} added=1\n")
+    elif stamp.exists():
+        stamp.unlink()
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "GBRAIN_STATE_DIR": str(st),
+           "GBRAIN_RESTIC_REPO": "x", "GBRAIN_RESTIC_HOST": "h", "RESTIC_PASSWORD_FILE": str(tmp_path / "pw"),
+           "GBRAIN_BACKUP_STAMP_DIR": str(stamps)}
+    r = subprocess.run(["bash", str(STACK / "cron" / "jobs" / "pg-backup.sh")], env=env, capture_output=True,
+                       text=True, timeout=60)
+    return r, stamp.read_text() if stamp.exists() else None, (bindir / "restic.log").read_text()
+
+
+@pytest.mark.parametrize("proc,prev,ok", [
+    (7_900_000, 10_000_000, False),    # below 80% of the last good run
+    (8_000_000, 10_000_000, True),     # exactly 80%
+    (2_000_000, None, True),           # first run: the 1 MB floor only
+    (900_000, None, False),            # first run below the floor
+])
+def test_pg_backup_size_check_against_last_good_run(tmp_path, proc, prev, ok):
+    r, stamp, rlog = _backup(tmp_path, proc, prev)
+    if ok:
+        assert r.returncode == 0 and f"processed={proc} " in stamp, r.stdout + r.stderr
+    else:
+        assert r.returncode == 1 and "FAILED" in r.stdout, r.stdout + r.stderr
+        assert stamp == (None if prev is None else f"1700000000 snapshot=00000000 processed={prev} added=1\n")
+        assert "forget --retry-lock 15m abcdef0123456789" in rlog   # the short snapshot was dropped

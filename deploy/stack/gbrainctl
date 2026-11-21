@@ -14,7 +14,8 @@ lib/mem0ctl/{render,compose,up}.py), one stdlib-only file (python >= 3.11 for to
 
 Refusals: on the production project (`gbrain`) `up`, `down` and every `compose` subcommand that is not read-only
 (anything outside READ_ONLY_COMPOSE: down, stop, rm, restart, kill, up, exec, run, ...) need --allow-prod.
-compose refuses an env file without the RENDERED header, and caller args that start with a global flag (they would
+compose refuses an env file without the RENDERED header, an env file rendered for another host (compose, up, down,
+status; render refuses to overwrite one), and caller args that start with a global flag (they would
 override -p / --env-file).
 Secrets never reach argv, stdout or an exception: a value is only written to a 0600 file.
 Last line of render: RENDER=ok host=<h> keys=<n> files=<m> changed=<k> skipped=<features off>.
@@ -247,11 +248,25 @@ def write_private(path: Path, data: bytes) -> bool:
     return True
 
 
+def rendered_for(env_file: Path) -> str | None:
+    """The host name in <stack>/.env's RENDERED header, or None when the file is absent or not rendered."""
+    try:
+        m = HEADER_RE.match(env_file.read_text().split("\n", 1)[0])
+    except FileNotFoundError:
+        return None
+    return m.group(3) if m else None
+
+
 def cmd_render(a) -> int:
     try:
         schema = load_toml(SCHEMA)
         h = load_host(a.host, a.host_file)
         stack = stack_dir(h, a.stack_dir)
+        other = rendered_for(stack / ".env")
+        if other is not None and other != h["name"]:
+            # another host's stack dir (e.g. --host studio-proof --stack-dir <prod>): rendering would overwrite its
+            # .env and secrets/* with this host's values
+            die(f"refusing render for host {h['name']!r}: {stack / '.env'} was rendered for host {other!r}")
         keys, files, off = resolve(schema, h, OpReader(h))
     except RenderError as e:
         die(f"render failed: {e}")
@@ -307,8 +322,13 @@ def run_compose(h: dict, stack: Path, args: list[str], capture=False):
         first = env_file.read_text().split("\n", 1)[0]
     except FileNotFoundError:
         die(f"{env_file} does not exist: run `gbrainctl render` first")
-    if not HEADER_RE.match(first):
+    m = HEADER_RE.match(first)
+    if not m:
         die(f"{env_file} is not a rendered file: run `gbrainctl render` first")
+    if m.group(3) != h["name"]:
+        # the project (-p) comes from the host file, the .env from the stack dir: a mismatch runs one host's project
+        # on another host's .env (prod's container names, volume and secrets) past the --allow-prod check
+        die(f"refusing compose for host {h['name']!r}: {env_file} was rendered for host {m.group(3)!r}", 3)
     return subprocess.run(compose_argv(h, stack) + args, env=clean_env(), capture_output=capture, text=capture)
 
 

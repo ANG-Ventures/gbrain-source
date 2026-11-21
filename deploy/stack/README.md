@@ -31,7 +31,8 @@ Files (mem0-selfhost-deploy's shapes, read its `bin/mem0ctl`, `hosts/*.toml`, `s
   (each header says what changed); `cron/lib/ingest-chunked.sh` and `rerank/proxy.py` are copies of the
   ANG-Ventures/gbrain files with only the host couplings made configurable.
 * `gbrain-stack-watch` the host-side monitor (docker + GitHub checks the containers cannot do; pages on failed job
-  results and on the rerank fallback). `tests/test_stack.py` the static contract.
+  results, the rerank fallback, DeepInfra 401/402 and a stopped rerank-tunnel; once per episode, open findings kept in
+  `<receipts_dir>/stack-watch-state.json`). `tests/test_stack.py` the static contract.
 
 ## Operating
 
@@ -151,7 +152,12 @@ for l in ai.gbrain.serve ai.gbrain.rerank-proxy ai.gbrain.rerank-tunnel; do laun
 # 2b. the brain repo index is shared by host git and the cron container: compare mtime+size only (else each side
 #     rehashes all 18 GB after the other wrote the index; measured in the proof)
 git -C ~/gbrain/brain config core.checkStat minimal && git -C ~/gbrain/brain config core.trustctime false
-# 3. keep the hand-run postgres container for rollback, under another name
+# 3. keep the hand-run postgres container for rollback, under another name. Its restart policy goes to `no` FIRST
+#    (it is unless-stopped, read 2026-11-21): else an OrbStack or Mac restart starts it again next to the compose
+#    postgres on the same volume and port 5433. Readback must print `no`; anything else: stop here.
+docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gbrain-pg            # unless-stopped (the rollback restores it)
+docker update --restart=no gbrain-pg
+docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gbrain-pg            # no
 docker stop -t 60 gbrain-pg && docker rename gbrain-pg gbrain-pg-launchd-era
 # 4. the stack
 python3.14 ./gbrainctl up --host studio --allow-prod
@@ -170,13 +176,28 @@ docker rm gbrain-pg-launchd-era
 
 ## Rollback (to the launchd jobs)
 
+Each step has its readback; do not start the next step until it prints what the comment says.
 ```
 cd ~/gbrain-stack-live/deploy/stack; U=$(id -u)
+# R1. silence the stack watch first, or it pages "service NOT RUNNING" every hour once the stack is down
+hermes cron pause <gbrain-stack-watch row>
+hermes cron list --all --json | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(j["id"], j.get("name"), j.get("enabled"), j.get("state")) for j in (d.get("jobs", d) if isinstance(d, dict) else d) if j.get("name") == "gbrain-stack-watch"]'   # enabled False / paused
+# R2. the stack down
 python3.14 ./gbrainctl down --host studio --allow-prod        # never `-v`: pgdata is external and stays
-docker rename gbrain-pg-launchd-era gbrain-pg && docker start gbrain-pg
+docker ps --filter label=com.docker.compose.project=gbrain -q | wc -l   # 0
+# R3. the launchd-era postgres back, with its restart policy restored
+docker rename gbrain-pg-launchd-era gbrain-pg && docker update --restart=unless-stopped gbrain-pg && docker start gbrain-pg
+docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' gbrain-pg            # unless-stopped
+until docker exec gbrain-pg pg_isready -q; do sleep 1; done; nc -z 127.0.0.1 5433 && echo pg-5433-ok   # pg-5433-ok
+# R4. the launchd jobs
 for l in ai.gbrain.rerank-tunnel ai.gbrain.rerank-proxy ai.gbrain.serve; do launchctl enable gui/$U/$l; launchctl bootstrap gui/$U ~/Library/LaunchAgents/$l.plist; done
+for l in ai.gbrain.rerank-tunnel ai.gbrain.rerank-proxy ai.gbrain.serve; do launchctl print gui/$U/$l | grep -m1 'state ='; done   # state = running x3
+until curl -sf -m 3 http://127.0.0.1:8199/health | grep -q '"engine":"postgres"'; do sleep 1; done; echo serve-ok   # serve-ok
+curl -s http://127.0.0.1:18085/health                                      # primary_ok true
+# R5. the launchd-era cron rows
 hermes cron pause <export-row>   # the export-only row; 9b1a4fdaaa2a below exports AND imports, as before
 hermes cron resume 9b1a4fdaaa2a; hermes cron resume a3bcde3fa92e; hermes cron resume 7d0b9686f64e
+hermes cron list --all --json | python3 -c 'import json,sys; d=json.load(sys.stdin); [print(j["id"], j.get("name"), j.get("enabled"), j.get("state")) for j in (d.get("jobs", d) if isinstance(d, dict) else d) if j["id"] in ("9b1a4fdaaa2a", "a3bcde3fa92e", "7d0b9686f64e")]'   # 3 rows: True scheduled
 ```
 The data volume is the same in both directions; nothing is migrated, so rollback loses nothing written meanwhile.
 After step 6 of the cutover (old container removed), rollback recreates it with the old `docker run` line from

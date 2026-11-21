@@ -52,9 +52,17 @@ case "$rc" in
 esac
 SNAP8="${SNAP:0:8}"
 [ "${PROC:-0}" -gt 1000000 ] 2>/dev/null || { drop_snap; echo "gbrain-pg-backup FAILED: dump suspiciously small (${PROC:-?} B, snapshot $SNAP8 dropped)"; exit 1; }
+# A wrong, emptied or truncated DB still passes the 1 MB floor: compare with the last good run's processed bytes
+# (the stamp below). No stamp, or no processed= in it, is the first run: the floor alone applies.
+# A deliberate big delete: run it once by hand with GBRAIN_PG_BACKUP_MIN_PCT=0 to move the baseline.
+MIN_PCT="${GBRAIN_PG_BACKUP_MIN_PCT:-80}"
+S="${GBRAIN_BACKUP_STAMP_DIR:-}/last-success-gbrain-pg-backup"
+PREV=$(sed -n 's/.* processed=\([0-9][0-9]*\).*/\1/p' "$S" 2>/dev/null | head -1) || true
+if [ -n "${GBRAIN_BACKUP_STAMP_DIR:-}" ] && [ -n "$PREV" ] && [ "$((PROC * 100))" -lt "$((PREV * MIN_PCT))" ]; then
+  drop_snap; echo "gbrain-pg-backup FAILED: dump shrank to $PROC B, below $MIN_PCT% of the last good run's $PREV B (snapshot $SNAP8 dropped; deliberate? rerun with GBRAIN_PG_BACKUP_MIN_PCT=0)"; exit 1
+fi
 logline "dumped -> restic snapshot $SNAP8 processed=$PROC added=$ADDED"
 if [ -n "${GBRAIN_BACKUP_STAMP_DIR:-}" ] && [ -d "$GBRAIN_BACKUP_STAMP_DIR" ]; then
-  S="$GBRAIN_BACKUP_STAMP_DIR/last-success-gbrain-pg-backup"
   echo "$(date +%s) snapshot=$SNAP8 processed=$PROC added=$ADDED" > "$S.tmp" && mv "$S.tmp" "$S"
 fi
 
