@@ -330,6 +330,8 @@ def cmd_updown(a, rest, verb) -> int:
 def cmd_build(a) -> int:
     h, _ = target(a)
     rev, arch = h["revision"], h["arch"]
+    if int(h.get("stack_uid", 0)) == 0:
+        die(f"{h['_file']}: stack_uid must be the non-root uid the images run as (the brain repo's owner)")
     repo = Path(a.repo).resolve() if a.repo else STACK_REPO.parents[1]
     tmp = Path(tempfile.mkdtemp(prefix="gbrain-build-"))
     wt = tmp / "src"

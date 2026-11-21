@@ -28,11 +28,13 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
 
-# A passwd entry for the uid (ssh refuses to run without one); -o: the uid/gid may already exist in the base
-# (bun is 1000, dialout is 20). /gbrain (GBRAIN_HOME, the gbrain-home volume) is created owned by it, so a fresh
-# named volume inherits that owner.
-RUN (getent group "${GBRAIN_GID}" >/dev/null || groupadd -g "${GBRAIN_GID}" gbrain) \
- && useradd -o -u "${GBRAIN_UID}" -g "${GBRAIN_GID}" -d /gbrain -M -s /usr/sbin/nologin gbrain \
+# The ONE passwd entry for the uid (ssh refuses to run without one, and reads ~/.ssh from it): a base-image user
+# already on that uid (bun is 1000) is removed first, so getpwuid() returns `gbrain`, not a stale home. The gid may
+# already exist (dialout is 20; the name does not matter). /gbrain (GBRAIN_HOME, the gbrain-home volume) is created
+# owned by the uid, so a fresh named volume inherits that owner.
+RUN if u="$(getent passwd "${GBRAIN_UID}" | cut -d: -f1)" && [ -n "$u" ]; then userdel "$u"; fi \
+ && (getent group "${GBRAIN_GID}" >/dev/null || groupadd -g "${GBRAIN_GID}" gbrain) \
+ && useradd -u "${GBRAIN_UID}" -g "${GBRAIN_GID}" -d /gbrain -M -s /usr/sbin/nologin gbrain \
  && install -d -o "${GBRAIN_UID}" -g "${GBRAIN_GID}" -m 0700 /gbrain
 
 WORKDIR /app

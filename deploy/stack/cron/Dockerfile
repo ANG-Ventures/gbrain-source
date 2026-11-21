@@ -57,6 +57,7 @@ RUN set -eu; \
     chmod 0755 /usr/local/bin/supercronic; \
     test "$(id -u gbrain)" = "${GBRAIN_UID}"; \
     usermod -d /state gbrain; \
+    test "$(getent passwd "${GBRAIN_UID}" | cut -d: -f1,6)" = "gbrain:/state"; \
     install -d -o "${GBRAIN_UID}" -g "${GBRAIN_GID}" -m 0700 /state
 
 COPY jobs/ /opt/gbrain-cron/jobs/

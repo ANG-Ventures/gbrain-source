@@ -14,8 +14,9 @@ ARG GBRAIN_GID=10001
 RUN apt-get update \
  && apt-get install -y --no-install-recommends openssh-client tini \
  && rm -rf /var/lib/apt/lists/* \
+ && if u="$(getent passwd "${GBRAIN_UID}" | cut -d: -f1)" && [ -n "$u" ]; then userdel "$u"; fi \
  && (getent group "${GBRAIN_GID}" >/dev/null || groupadd -g "${GBRAIN_GID}" gbrain) \
- && useradd -o -m -u "${GBRAIN_UID}" -g "${GBRAIN_GID}" -s /usr/sbin/nologin gbrain
+ && useradd -m -u "${GBRAIN_UID}" -g "${GBRAIN_GID}" -s /usr/sbin/nologin gbrain
 COPY proxy.py /opt/gbrain-rerank/proxy.py
 COPY tunnel.sh /opt/gbrain-rerank/tunnel.sh
 RUN chmod 0755 /opt/gbrain-rerank/tunnel.sh && python3 -m py_compile /opt/gbrain-rerank/proxy.py && sh -n /opt/gbrain-rerank/tunnel.sh
