@@ -138,6 +138,14 @@ export function getPostgresSchema(
 // See TODOS.md item: "err.code-based connection-error matching" for the
 // follow-up that will reintroduce a typed retry mechanism.
 
+/** TTL for PostgresEngine.getAllConfig's in-process snapshot. Bad values fall back to the default. */
+export function configSnapshotTtlMs(env: Record<string, string | undefined> = process.env): number {
+  const raw = (env.GBRAIN_CONFIG_SNAPSHOT_TTL_MS ?? '').trim();
+  if (raw === '') return 10_000;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : 10_000;
+}
+
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
   private _sql: ReturnType<typeof postgres> | null = null;
@@ -5371,19 +5379,27 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async setConfig(key: string, value: string): Promise<void> {
-    return this.connRetry(async () => {
-      await this.sql`
-        INSERT INTO config (key, value) VALUES (${key}, ${value})
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-      `;
-    });
+    try {
+      return await this.connRetry(async () => {
+        await this.sql`
+          INSERT INTO config (key, value) VALUES (${key}, ${value})
+          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        `;
+      });
+    } finally {
+      this._dropConfigCache();
+    }
   }
 
   async unsetConfig(key: string): Promise<number> {
-    return this.connRetry(async () => {
-      const result = await this.sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
-      return result.count ?? 0;
-    });
+    try {
+      return await this.connRetry(async () => {
+        const result = await this.sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
+        return result.count ?? 0;
+      });
+    } finally {
+      this._dropConfigCache();
+    }
   }
 
   async listConfigKeys(prefix: string): Promise<string[]> {
@@ -5399,15 +5415,39 @@ export class PostgresEngine implements BrainEngine {
     });
   }
 
+  /**
+   * Whole-table config snapshot, cached in-process for GBRAIN_CONFIG_SNAPSHOT_TTL_MS
+   * (default 10000; 0 disables). A long-lived `gbrain serve` resolves config on
+   * every request, and the table holds a 1.2 MB row, so the uncached read ran
+   * ~51k times a day at 2.5 ms each. setConfig/unsetConfig on this engine drop
+   * the cache; a write from another process is seen within the TTL. Callers get
+   * a copy, so mutating the result never touches the cache.
+   */
+  private _allConfigCache: { at: number; rows: Record<string, string> } | null = null;
+  private _configGen = 0;
+
+  private _dropConfigCache(): void {
+    this._allConfigCache = null;
+    this._configGen++;
+  }
+
   async getAllConfig(): Promise<Record<string, string>> {
-    return this.connRetry(async () => {
+    const ttl = configSnapshotTtlMs();
+    const hit = this._allConfigCache;
+    if (ttl > 0 && hit && Date.now() - hit.at < ttl) return { ...hit.rows };
+    const gen = this._configGen;
+    const out = await this.connRetry(async () => {
       const rows = await this.sql<{ key: string; value: string }[]>`
         SELECT key, value FROM config
       `;
-      const out: Record<string, string> = {};
-      for (const row of rows) out[row.key] = row.value;
-      return out;
+      const map: Record<string, string> = {};
+      for (const row of rows) map[row.key] = row.value;
+      return map;
     });
+    // A write on this engine while the read was in flight bumps the generation:
+    // keep the cache empty so the next read sees the write.
+    if (ttl > 0 && gen === this._configGen) this._allConfigCache = { at: Date.now(), rows: out };
+    return { ...out };
   }
 
   // Migration support
