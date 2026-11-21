@@ -133,6 +133,8 @@ services:
       GBRAIN_RESTIC_HOST: "${GBRAIN_RESTIC_HOST:?GBRAIN_RESTIC_HOST unset}"
       GBRAIN_RESTIC_INIT_OK: "${GBRAIN_RESTIC_INIT_OK:-0}"
       GBRAIN_RECEIPTS_DIR: /receipts
+      GBRAIN_GIT_NAME: "${GBRAIN_GIT_NAME:?GBRAIN_GIT_NAME unset}"
+      GBRAIN_GIT_EMAIL: "${GBRAIN_GIT_EMAIL:?GBRAIN_GIT_EMAIL unset}"
       GBRAIN_BACKUP_STAMP_DIR: /backup-stamps
     secrets:
       - openai-key

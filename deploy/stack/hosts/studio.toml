@@ -35,6 +35,8 @@ cron_uid         = 502                   # owner of ~/gbrain/brain on this host
 cron_gid         = 20
 gbrain_home      = "~/gbrain"            # GBRAIN_HOME in the cron container; the brain is mounted at <this>/brain
 brain_source     = "~/gbrain/brain"
+git_name         = "Kyzcreig"                                   # the brain repo nightly commits' author (host git config)
+git_email        = "9063726+Kyzcreig@users.noreply.github.com"
 receipts_dir     = "~/.hermes/state/gbrain-stack"
 backup_stamp_dir = "~/.hermes/state/backup"   # last-success-gbrain-pg-backup, read by the fleet backup freshness check
 restic           = { repo = "sftp:truenas_admin@192.168.1.159:/mnt/tank/backups/gbrain/pg-restic", host = "mac-studio-m3u", init_ok = 0 }

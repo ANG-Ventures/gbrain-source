@@ -88,9 +88,14 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 /usr/local/bin/gbrain extract-links >>"$LOG" 2>&1 || echo "gbrain-nightly-sync: extract-links failed (non-fatal)" >>"$LOG"
 touch "$STAMP"
+# The brain repo's index is shared with host-side git (exporters, the GitHub mirror). Through the bind mount the
+# container sees other inode/dev/uid/ctime values than the host, so default stat checks would rehash every file
+# (18 GB) on each side after the other wrote the index. Compare mtime + size only (measured in the proof: the first
+# `git add -A` over the mount re-read the whole tree). The cutover sets the same two keys in the repo config.
+G=(git -C "$BRAIN" -c core.checkStat=minimal -c core.trustctime=false)
 committed=0
-if git -C "$BRAIN" add -A 2>>"$LOG" && ! git -C "$BRAIN" diff --cached --quiet 2>/dev/null; then
-  git -C "$BRAIN" -c user.name="gbrain-cron" -c user.email="gbrain-cron@localhost" \
+if "${G[@]}" add -A 2>>"$LOG" && ! "${G[@]}" diff --cached --quiet 2>/dev/null; then
+  "${G[@]}" -c user.name="${GBRAIN_GIT_NAME:-gbrain-cron}" -c user.email="${GBRAIN_GIT_EMAIL:-gbrain-cron@localhost}" \
     commit -q -m "nightly sync: $(date +%F) incremental ingest" 2>>"$LOG" && committed=1
 fi
 echo "EFFECT {\"roots_imported\": $n_roots, \"brain_committed\": $committed}"

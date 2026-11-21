@@ -35,6 +35,8 @@ cron_uid         = 502
 cron_gid         = 20
 gbrain_home      = "~/gbrain"                      # same container path as studio (source_ref match) ...
 brain_source     = "~/gbrain-stack-proof/brain"    # ... but the mount is an APFS clone (cp -c) of ~/gbrain/brain
+git_name         = "Kyzcreig"                                   # the brain repo nightly commits' author (host git config)
+git_email        = "9063726+Kyzcreig@users.noreply.github.com"
 receipts_dir     = "~/gbrain-stack-proof/receipts"
 backup_stamp_dir = "~/gbrain-stack-proof/receipts"
 restic           = { repo = "/state/proof-restic", host = "mac-studio-m3u", init_ok = 1 }
