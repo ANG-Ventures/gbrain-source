@@ -19,7 +19,7 @@ rerank_image    = "gbrain-rerank:99aa9fca7a74-arm64"
 cron_image      = "gbrain-cron:99aa9fca7a74-arm64"
 
 compose_project = "gbrain-proof"
-compose_files   = ["docker-compose.yaml", "docker-compose.studio.yaml"]
+compose_files   = ["docker-compose.yaml", "docker-compose.studio.yaml", "docker-compose.proof.yaml"]
 stack_dir       = "~/gbrain-stack-proof/deploy/stack"
 pg_container    = "gbrain-proof-pg"
 pg_volume       = "gbrain-pgdata-proof"
