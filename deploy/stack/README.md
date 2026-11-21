@@ -77,6 +77,23 @@ Final images: `422c0550` (same app code). Measured 2026-11-20 22:02-23:05 PT:
 | git over the bind mount (live repo, read-only, `--no-optional-locks`) | container default stat checks 481 s, container `core.checkStat=minimal` 14 s, host native 3 s |
 | downtime of a stop -> new containers -> up cycle (proof) | stop to `/health` ok 15.5 s, to first answered search 15.9 s (12.7 s of it is `up`, mostly the postgres healthcheck interval) |
 
+Round 1 re-run (2026-11-21 09:11-10:10 PT, non-root images `fe172fe0` built at 502:20, a FRESH `pg_basebackup` of
+live `gbrain-pg`, a new brain clone, 20 real recent Discord turns):
+
+| check | result |
+|---|---|
+| uid | server, rerank-proxy and cron: image `User 502:20`, PID 1 `Uid 502`; `/state`, `/state/secrets/*`, `.pgpass` 502:20 0600/0700; `<gbrain_home>/.gbrain` tmpfs uid=502 mode 0700 |
+| same answers, proof `query_cache` emptied (63,017 rows -> 0) | 20/20 identical, live vs live 20/20; then warm 20/20 |
+| health | `gbrainctl up` -> server `/health` engine=postgres in 16.1 s (postgres start included); recreate of the app services only: 9.9 s; rerank `primary_ok: true`; `gbrainctl status` STATUS=ok rc 0 |
+| bind mounts and volumes as 502 | nightly-sync ok 611.6 s, 10 roots, commit in the brain clone by the host identity, `.git/index` still 502:20; result files in the host receipts dir 502:20; pg-backup ok 102 s into the scratch restic repo on the cron-state volume; deploy-parity ok |
+| .mdx-only night | stamp present, no change: `nothing_new`; one new `.mdx` only: the gate passes, `roots_imported: 10`, the page is in the proof DB (three probes) |
+| amd64 | the three images build on ace-ai at uid 1000:1000 (the bun base user's uid: it is removed, getpwuid(1000) = `gbrain`, cron home `/state`) |
+
+One cold compare on the earlier `b63f3b39` images, run AFTER the proof's own nightly import, gave 19/20: the extra
+hit was the `shelly` page, which that import had just re-imported from a newer brain file (proof `updated_at`
+2026-11-21 17:27Z vs live 2026-11-19). That is the proof DB being ahead of live, not the stack; the fresh-copy run
+above is the comparison of record.
+
 Cores and memory, 60 searches per side (20 new turns + 40 repeats), same moment, live = launchd processes, proof =
 containers (cgroup): server 3.98 vs 3.16 CPU-s, rerank proxy 0.22 vs 0.08 CPU-s, server memory 364 MiB RSS vs
 206 MiB, postgres CPU 6.3 % vs 4.5 % avg (docker stats), postgres memory 3.6 GiB vs 2.2 GiB (the proof's
