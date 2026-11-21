@@ -84,6 +84,22 @@ class DbLock:
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
+    def held(self, timeout: float = 15.0) -> bool:
+        """Is the lock still OURS? psql silently reconnects after a server restart (a new session, lock gone),
+        so `alive()` alone is not enough: ask pg_locks from the coprocess's own session."""
+        if not self.alive():
+            return False
+        import select
+        try:
+            self.proc.stdin.write("select count(*) from pg_locks where locktype = 'advisory' and granted and "
+                                  f"pid = pg_backend_pid() and classid = 7271 and objid = {lock_key(self.name)} "
+                                  "and objsubid = 2;\n")
+            self.proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            return False
+        r, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        return bool(r) and self.proc.stdout.readline().strip() == "1"
+
     def release(self) -> None:
         if self.proc and self.proc.poll() is None:
             try:
@@ -199,8 +215,15 @@ def serve() -> int:
             child.send_signal(signum)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, stop)
-    while not stopping and child.poll() is None and inst.alive():
+    last_check = time.monotonic()
+    while not stopping and child.poll() is None:
         time.sleep(1)
+        if time.monotonic() - last_check >= 30:
+            last_check = time.monotonic()
+            if not inst.held():
+                print("gbrainjob serve: lost the instance lock (database restarted?); exiting so the container "
+                      "restarts and takes it again", file=sys.stderr, flush=True)
+                break
     if child.poll() is None:
         child.terminate()
         child.wait()
