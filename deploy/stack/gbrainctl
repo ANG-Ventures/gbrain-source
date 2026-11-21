@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""gbrainctl: the gbrain stack operator CLI (card t_ab2fcba3). mem0ctl's shapes (mem0-selfhost-deploy bin/mem0ctl,
+lib/mem0ctl/{render,compose,up}.py), one stdlib-only file (python >= 3.11 for tomllib):
+
+  gbrainctl render  --host H              write <stack>/.env + <stack>/secrets/* from env.schema.toml, hosts/H.toml
+                                          and 1Password (op-cached-read). Deterministic: no timestamp in the header.
+  gbrainctl compose --host H -- ARGS      the ONLY sanctioned docker compose entrypoint: clean env (PATH, HOME,
+                                          DOCKER_HOST), the rendered --env-file, -p and every -f from the host file
+  gbrainctl up      --host H [--allow-prod] [-- SERVICES]   render, then compose up -d
+  gbrainctl down    --host H [--allow-prod] [-- ARGS]
+  gbrainctl build   --host H [--repo DIR] build the host's three images from a CLEAN detached worktree at the
+                                          host file's `revision` (never the caller's tree), for the host's arch
+  gbrainctl status  --host H              compose ps + each running container's revision label vs the pin
+
+Refusals: `up`/`down` on the production project (`gbrain`) need --allow-prod. compose refuses an env file without
+the RENDERED header, and caller args that start with a global flag (they would override -p / --env-file).
+Secrets never reach argv, stdout or an exception: a value is only written to a 0600 file.
+Last line of render: RENDER=ok host=<h> keys=<n> files=<m> changed=<k> skipped=<features off>.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+if sys.version_info < (3, 11):  # pragma: no cover
+    sys.exit("gbrainctl: needs python >= 3.11 (tomllib); set GBRAINCTL_PYTHON")
+import tomllib  # noqa: E402
+
+STACK_REPO = Path(__file__).resolve().parent                 # deploy/stack in the checkout this file lives in
+SCHEMA = STACK_REPO / "env.schema.toml"
+HOSTS = STACK_REPO / "hosts"
+PROD_PROJECT = "gbrain"
+HEADER_RE = re.compile(r"^# RENDERED by gbrainctl (\S+) schema=(\S+) from hosts/(\S+)\.toml; do not edit$")
+PLACEHOLDER_RE = re.compile(r"<[^<>]+>")
+SAFE_VALUE_RE = re.compile(r"[A-Za-z0-9_./:,@+=%-]*")
+TOKEN_RE = re.compile(r"\{([^{}]+)\}")
+
+
+class RenderError(Exception):
+    """A render input is missing or wrong. The message names the key, never a value."""
+
+
+def die(msg: str, rc: int = 2):
+    print(f"gbrainctl: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def load_toml(p: Path) -> dict:
+    try:
+        return tomllib.loads(p.read_text())
+    except FileNotFoundError:
+        raise RenderError(f"{p} not found")
+    except tomllib.TOMLDecodeError as e:
+        raise RenderError(f"{p}: {e}")
+
+
+def load_host(name: str | None, host_file: str | None) -> dict:
+    if host_file:
+        p = Path(host_file)
+    else:
+        if not name or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
+            die("--host <name> (or --host-file) is required", 64)
+        p = HOSTS / f"{name}.toml"
+    h = load_toml(p)
+    h["_file"] = p.name
+    if not host_file and h.get("name") != p.stem:
+        raise RenderError(f"{p.name}: name = {h.get('name')!r} does not match the file name")
+    return h
+
+
+def lookup(h: dict, dotted: str):
+    cur = h
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise KeyError(dotted)
+        cur = cur[part]
+    return cur
+
+
+def stack_dir(h: dict, override: str | None) -> Path:
+    if override:
+        return Path(os.path.expanduser(override))
+    if "stack_dir" not in h:
+        raise RenderError(f"{h['_file']}: stack_dir missing")
+    return Path(os.path.expanduser(h["stack_dir"]))
+
+
+def derived(h: dict) -> dict:
+    return {"compose_profiles": "tunnel" if h.get("rerank_tunnel") else "none"}
+
+
+def fill(template: str, h: dict, label: str) -> str:
+    d = derived(h)
+    t = template.replace("{{", "\x00").replace("}}", "\x01")
+
+    def one(m: re.Match) -> str:
+        tok = m.group(1)
+        if tok in d:
+            return d[tok]
+        path_tok = tok.startswith("path:")
+        tok = tok[5:] if path_tok else tok
+        try:
+            v = lookup(h, tok)
+        except KeyError:
+            raise RenderError(f"{label}: host profile {h['_file']} has no `{tok}`")
+        if isinstance(v, (dict, list)):
+            raise RenderError(f"{label}: host value `{tok}` is not a scalar")
+        v = str(v).lower() if isinstance(v, bool) else str(v)
+        return os.path.expanduser(v) if path_tok else v
+    return TOKEN_RE.sub(one, t).replace("\x00", "{").replace("\x01", "}")
+
+
+class OpReader:
+    """One read per distinct ref per render, through the host's op_reader (op-cached-read: stdout = the value)."""
+
+    def __init__(self, h: dict):
+        self.cmd = os.path.expanduser(os.environ.get("GBRAINCTL_OP_READER") or h.get("op_reader", ""))
+        if not self.cmd:
+            raise RenderError(f"{h['_file']}: op_reader missing")
+        self.token_file = os.path.expanduser(h["op_token_file"]) if h.get("op_token_file") else None
+        self.op_bin = os.path.expanduser(h["op_bin"]) if h.get("op_bin") else None
+        self.cache: dict[str, str | None] = {}
+        self.calls = 0
+
+    def read(self, ref: str, label: str, optional: bool = False) -> str | None:
+        if ref not in self.cache:
+            env = dict(os.environ)
+            if self.token_file and not env.get("OP_SERVICE_ACCOUNT_TOKEN"):
+                env["OP_SERVICE_ACCOUNT_TOKEN_FILE"] = self.token_file
+            if self.op_bin and not env.get("OP_BIN"):
+                env["OP_BIN"] = self.op_bin
+            self.calls += 1
+            try:
+                r = subprocess.run([self.cmd, ref], capture_output=True, text=True, env=env, timeout=90)
+                val = r.stdout.rstrip("\n") if r.returncode == 0 else ""
+                why = (r.stderr.strip().splitlines() or ["empty value"])[-1][:200]
+            except (OSError, subprocess.TimeoutExpired) as e:
+                val, why = "", type(e).__name__
+            self.cache[ref] = val or None
+            if not val and not optional:
+                raise RenderError(f"1P ref for {label} unreadable: {why}")
+        return self.cache[ref]
+
+
+def note_field(body: str, field: str, label: str) -> str:
+    for line in body.splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.strip() == field:
+            return v.strip()
+    raise RenderError(f"{label}: field {field} not found in its 1P note")
+
+
+def resolve(schema: dict, h: dict, reader: OpReader | None):
+    """-> ({KEY: value} in schema order, {relpath: bytes}, [features off])."""
+    keys: dict[str, str] = {}
+    for k in schema.get("key", []):
+        name = k["name"]
+        if k["source"] == "const":
+            v = str(k["value"])
+        elif k["source"] == "host":
+            v = fill(k["template"], h, name)
+        else:
+            raise RenderError(f"{name}: .env keys are const|host only (secrets are files)")
+        if v == "" or PLACEHOLDER_RE.search(v) or not SAFE_VALUE_RE.fullmatch(v):
+            raise RenderError(f"{name}: rendered value is empty, a <placeholder>, or not .env-safe ({v!r})")
+        keys[name] = v
+    files: dict[str, bytes] = {}
+    off: list[str] = []
+    for f in schema.get("file", []):
+        label = f"secrets/{f['path']}"
+        feat = f.get("when")
+        if feat and not h.get(feat):
+            files[f["path"]] = b""
+            off.append(f["path"])
+            continue
+        if f["source"] == "host":
+            v = fill(f["template"], h, label)
+        elif f["source"] == "1p":
+            if reader is None:
+                raise RenderError(f"{label}: needs 1Password but no reader is configured")
+            raw = reader.read(f["ref"], label, optional=bool(f.get("optional")))
+            if raw is None:
+                files[f["path"]] = b""
+                off.append(f["path"] + "(optional,unread)")
+                continue
+            v = note_field(raw, f["field"], label) if f.get("field") else raw
+        else:
+            raise RenderError(f"{label}: source must be host|1p")
+        if not v or PLACEHOLDER_RE.fullmatch(v):
+            raise RenderError(f"{label}: rendered value is empty")
+        if f.get("encoding") == "base64":
+            try:
+                data = base64.b64decode(v, validate=True)
+            except ValueError:
+                raise RenderError(f"{label}: value is not valid base64")
+        else:
+            data = v.encode()
+        if f.get("newline") and not data.endswith(b"\n"):
+            data += b"\n"
+        files[f["path"]] = data
+    return keys, files, off
+
+
+def git_sha() -> str:
+    r = subprocess.run(["git", "-C", str(STACK_REPO), "rev-parse", "--short=12", "HEAD"], capture_output=True, text=True)
+    sha = r.stdout.strip() if r.returncode == 0 else "nogit"
+    d = subprocess.run(["git", "-C", str(STACK_REPO), "status", "--porcelain", "--", "env.schema.toml", "hosts"],
+                       capture_output=True, text=True)
+    return sha + ("-dirty" if d.stdout.strip() else "")
+
+
+def schema_sha() -> str:
+    import hashlib
+    return hashlib.sha256(SCHEMA.read_bytes()).hexdigest()[:12]
+
+
+def write_private(path: Path, data: bytes) -> bool:
+    try:
+        if path.read_bytes() == data:
+            os.chmod(path, 0o600)
+            return False
+    except FileNotFoundError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    tmp = path.with_name(f".{path.name}.gbrainctl-tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    return True
+
+
+def cmd_render(a) -> int:
+    try:
+        schema = load_toml(SCHEMA)
+        h = load_host(a.host, a.host_file)
+        stack = stack_dir(h, a.stack_dir)
+        keys, files, off = resolve(schema, h, OpReader(h))
+    except RenderError as e:
+        die(f"render failed: {e}")
+    text = (f"# RENDERED by gbrainctl {git_sha()} schema={schema_sha()} from hosts/{h['name']}.toml; do not edit\n"
+            + "".join(f"{k}={v}\n" for k, v in keys.items()))
+    changed = int(write_private(stack / ".env", text.encode()))
+    for p, data in sorted(files.items()):
+        changed += int(write_private(stack / "secrets" / p, data))
+    for d in ("receipts_dir", "backup_stamp_dir"):
+        if h.get(d):
+            Path(os.path.expanduser(h[d])).mkdir(parents=True, exist_ok=True)
+    print(f"RENDER=ok host={h['name']} keys={len(keys)} files={len(files)} changed={changed} "
+          f"skipped={','.join(off) or '-'}")
+    return 0
+
+
+def compose_argv(h: dict, stack: Path) -> list[str]:
+    argv = ["docker", "compose", "--project-directory", str(stack), "-p", h["compose_project"],
+            "--env-file", str(stack / ".env")]
+    for f in h.get("compose_files") or []:
+        argv += ["-f", str(stack / f)]
+    return argv
+
+
+def clean_env() -> dict:
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": os.environ.get("HOME", "/")}
+    if os.environ.get("DOCKER_HOST"):
+        env["DOCKER_HOST"] = os.environ["DOCKER_HOST"]
+    return env
+
+
+def run_compose(h: dict, stack: Path, args: list[str], capture=False):
+    if args and args[0].startswith("-"):
+        die(f"compose args must start with a compose subcommand, not global flag {args[0]!r}", 64)
+    env_file = stack / ".env"
+    try:
+        first = env_file.read_text().split("\n", 1)[0]
+    except FileNotFoundError:
+        die(f"{env_file} does not exist: run `gbrainctl render` first")
+    if not HEADER_RE.match(first):
+        die(f"{env_file} is not a rendered file: run `gbrainctl render` first")
+    return subprocess.run(compose_argv(h, stack) + args, env=clean_env(), capture_output=capture, text=capture)
+
+
+def target(a):
+    try:
+        h = load_host(a.host, a.host_file)
+        return h, stack_dir(h, a.stack_dir)
+    except RenderError as e:
+        die(str(e))
+
+
+def cmd_compose(a, rest) -> int:
+    h, stack = target(a)
+    if not rest:
+        die("usage: gbrainctl compose --host <name> -- <compose args>", 64)
+    return run_compose(h, stack, rest).returncode
+
+
+def cmd_updown(a, rest, verb) -> int:
+    h, stack = target(a)
+    if h["compose_project"] == PROD_PROJECT and not a.allow_prod:
+        die(f"refusing `{verb}` on the production project {PROD_PROJECT!r} without --allow-prod", 3)
+    if verb == "up":
+        rc = cmd_render(a)
+        if rc:
+            return rc
+    rc = run_compose(h, stack, (["up", "-d"] if verb == "up" else ["down"]) + rest).returncode
+    print(f"{verb.upper()}={'ok' if rc == 0 else 'fail'} project={h['compose_project']} rc={rc}")
+    return rc
+
+
+def cmd_build(a) -> int:
+    h, _ = target(a)
+    rev, arch = h["revision"], h["arch"]
+    repo = Path(a.repo).resolve() if a.repo else STACK_REPO.parents[1]
+    tmp = Path(tempfile.mkdtemp(prefix="gbrain-build-"))
+    wt = tmp / "src"
+    run = lambda *c, **kw: subprocess.run(list(c), check=True, **kw)  # noqa: E731
+    try:
+        run("git", "-C", str(repo), "worktree", "add", "--detach", str(wt), rev)
+        base = ["docker", "buildx", "build", "--platform", f"linux/{arch}", "--load",
+                "--build-arg", f"GBRAIN_REVISION={rev}"]
+        run(*base, "-f", str(wt / "deploy/stack/server/Dockerfile"), "-t", h["server_image"], str(wt))
+        run(*base, "-f", str(wt / "deploy/stack/rerank/Dockerfile"), "-t", h["rerank_image"],
+            str(wt / "deploy/stack/rerank"))
+        run(*base, "--build-arg", f"SERVER_IMAGE={h['server_image']}", "-f", str(wt / "deploy/stack/cron/Dockerfile"),
+            "-t", h["cron_image"], str(wt / "deploy/stack/cron"))
+    except subprocess.CalledProcessError as e:
+        print(f"BUILD=fail rc={e.returncode} cmd={' '.join(e.cmd[:6])}")
+        return 1
+    finally:
+        subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], capture_output=True)
+    print(f"BUILD=ok revision={rev} arch={arch} images={h['server_image']},{h['rerank_image']},{h['cron_image']}")
+    return 0
+
+
+def cmd_status(a) -> int:
+    h, stack = target(a)
+    r = run_compose(h, stack, ["ps", "--format", "{{.Name}} {{.Image}} {{.Status}}"], capture=True)
+    bad = 0
+    for line in r.stdout.splitlines():
+        name = line.split()[0]
+        lab = subprocess.run(["docker", "inspect", name, "--format",
+                              '{{index .Config.Labels "org.opencontainers.image.revision"}}'],
+                             capture_output=True, text=True).stdout.strip()
+        ok = lab in ("", h["revision"]) or "pgvector" in line   # postgres is an upstream image (no label)
+        bad += 0 if ok else 1
+        print(f"{line}  revision={lab or '-'}{'' if ok else '  != pin ' + h['revision'][:12]}")
+    print(f"STATUS={'ok' if bad == 0 and r.returncode == 0 else 'drift'} project={h['compose_project']}")
+    return 0 if bad == 0 else 1
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    rest: list[str] = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, rest = argv[:i], argv[i + 1:]
+    ap = argparse.ArgumentParser(prog="gbrainctl", description=__doc__.split("\n", 1)[0])
+    ap.add_argument("sub", choices=["render", "compose", "up", "down", "build", "status"])
+    ap.add_argument("--host")
+    ap.add_argument("--host-file")
+    ap.add_argument("--stack-dir", help="override the host file's stack_dir")
+    ap.add_argument("--allow-prod", action="store_true")
+    ap.add_argument("--repo", help="build: the git repo to cut the clean worktree from (default: this checkout)")
+    a = ap.parse_args(argv)
+    if a.sub == "render":
+        return cmd_render(a)
+    if a.sub == "compose":
+        return cmd_compose(a, rest)
+    if a.sub in ("up", "down"):
+        return cmd_updown(a, rest, a.sub)
+    if a.sub == "build":
+        return cmd_build(a)
+    return cmd_status(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,42 @@
+# hosts/studio.toml: the Mac Studio, gbrain's serving host (card t_ab2fcba3). Reviewed in git; NO secrets.
+# The only place a host address, port map or host path may appear (the mem0-selfhost-deploy hosts/*.toml rule).
+# Paths starting with ~ expand against the HOME of whoever runs gbrainctl.
+name            = "studio"
+os              = "darwin"
+arch            = "arm64"
+docker_host_gw  = "host.docker.internal"   # OrbStack name for the host loopback (mem0's hosts/studio.toml)
+
+# the build every container of this host runs: ANG-Ventures/gbrain-source commit, built per arch by `gbrainctl build`
+revision        = "9bd1cfebb31a349484d30edd665a30f9b834b686"   # = master and the launchd serve's ~/gbrain/app HEAD, 2026-11-20
+server_image    = "gbrain-server:9bd1cfebb31a-arm64"
+rerank_image    = "gbrain-rerank:9bd1cfebb31a-arm64"
+cron_image      = "gbrain-cron:9bd1cfebb31a-arm64"
+
+# compose (the checkout `gbrainctl` runs from is the deploy tree; compose files are relative to deploy/stack)
+compose_project = "gbrain"
+compose_files   = ["docker-compose.yaml", "docker-compose.studio.yaml"]
+stack_dir       = "~/gbrain-stack-live/deploy/stack"   # a detached checkout of gbrain-source at `revision`, never ~/gbrain/app
+pg_container    = "gbrain-pg"            # the name the backup drills, the reaper policy and the fleet lints know
+pg_volume       = "gbrain-pgdata"        # the EXISTING volume (external)
+ports           = { pg = 5433, serve = 8199, rerank = 18085 }   # the launchd-era ports: every caller keeps its URL
+relay_ports     = { anthropic = 18810 }  # claude-apr relay (the launcher's ANTHROPIC_BASE_URL)
+
+# rerank path: the in-stack tunnel to zerank-native on ACE-AI
+rerank_tunnel        = true
+rerank_tunnel_target = "ace@192.168.1.216"
+rerank_primary       = "http://rerank-tunnel:18084"
+
+# cron
+nas_backup       = true
+cron_uid         = 502                   # owner of ~/gbrain/brain on this host
+cron_gid         = 20
+gbrain_home      = "~/gbrain"            # GBRAIN_HOME in the cron container; the brain is mounted at <this>/brain
+brain_source     = "~/gbrain/brain"
+receipts_dir     = "~/.hermes/state/gbrain-stack"
+backup_stamp_dir = "~/.hermes/state/backup"   # last-success-gbrain-pg-backup, read by the fleet backup freshness check
+restic           = { repo = "sftp:truenas_admin@192.168.1.159:/mnt/tank/backups/gbrain/pg-restic", host = "mac-studio-m3u", init_ok = 0 }
+
+# tools
+op_reader       = "~/.hermes/scripts/op-cached-read"
+op_bin          = "/opt/homebrew/bin/op"
+op_token_file   = "~/.hermes/.op-service-token"

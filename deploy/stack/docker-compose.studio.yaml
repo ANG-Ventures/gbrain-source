@@ -1,0 +1,31 @@
+# deploy/stack/docker-compose.studio.yaml: the Mac Studio overlay (card t_ab2fcba3). Loaded by hosts/studio.toml and
+# hosts/studio-proof.toml (the side-by-side proof on the same box). arm64 images, and a cpu AND memory limit on every
+# service: the home repo's fleet-container-reaper/orbstack-policy refuses unbounded containers in the VM
+# (t_2c886bf2, `required-orbstack-cap`), and prod is counted against prod_reserve_cores / prod_reserve_mib.
+#   postgres  2.0 / 10g / shm 2g: the values ANG-Ventures/gbrain deploy/gbrain-pg carries today (measured
+#             2026-10-11: shared_buffers 6GB + 4g headroom for work_mem / maintenance_work_mem).
+#   server    4.0 / 4g: the launchd serve ran unbounded at RSS 327 MiB idle (ps, 2026-11-20 21:4x PT); the proof
+#             measures it under the 20-query set and the nightly import (README "Measured").
+#   rerank-*  stdlib python proxy and an ssh client: 0.5 / 256m and 0.25 / 64m.
+#   cron      2.0 / 4g: the nightly import runs bun `gbrain import` + embeddings in this container.
+services:
+  postgres:
+    platform: linux/arm64
+    cpus: 2.0
+    mem_limit: 10g
+  server:
+    platform: linux/arm64
+    cpus: 4.0
+    mem_limit: 4g
+  rerank-proxy:
+    platform: linux/arm64
+    cpus: 0.5
+    mem_limit: 256m
+  rerank-tunnel:
+    platform: linux/arm64
+    cpus: 0.25
+    mem_limit: 64m
+  cron:
+    platform: linux/arm64
+    cpus: 2.0
+    mem_limit: 4g
