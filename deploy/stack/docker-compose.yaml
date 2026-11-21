@@ -120,8 +120,6 @@ services:
         condition: service_healthy
     environment:
       TZ: "${GBRAIN_CRON_TZ:-America/Los_Angeles}"
-      GBRAIN_CRON_UID: "${GBRAIN_CRON_UID:?GBRAIN_CRON_UID unset}"
-      GBRAIN_CRON_GID: "${GBRAIN_CRON_GID:?GBRAIN_CRON_GID unset}"
       GBRAIN_HOST_NAME: "${GBRAIN_HOST_NAME:?GBRAIN_HOST_NAME unset}"
       GBRAIN_HOME: "${GBRAIN_HOST_HOME:?GBRAIN_HOST_HOME unset}"
       GBRAIN_EXPECTED_REVISION: "${GBRAIN_REVISION:?GBRAIN_REVISION unset}"
@@ -148,6 +146,11 @@ services:
       - restic-password
       - nas-ssh-key
       - nas-known-hosts
+    # The image runs as the non-root stack uid (GBRAIN_UID). <gbrain_home>/.gbrain (gbrain's config dir) sits under a
+    # path docker creates as root for the brain bind below, so it is a tmpfs owned by that uid; the entrypoint
+    # re-copies config.json into it on every start and every `gbrain` call.
+    tmpfs:
+      - "${GBRAIN_HOST_HOME}/.gbrain:uid=${GBRAIN_UID:?GBRAIN_UID unset},gid=${GBRAIN_GID:?GBRAIN_GID unset},mode=0700"
     volumes:
       - cron-state:/state
       # the brain repo, mounted at <gbrain_home>/brain = the HOST path the launchd job imported from:

@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -39,7 +40,11 @@ def sh(*cmd, timeout=30):
 
 
 def get_json(url, timeout=8):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    # only the stack's own published ports on this host's loopback, over plain http (never file:// or a remote)
+    p = urllib.parse.urlsplit(url)
+    if p.scheme != "http" or p.hostname != "127.0.0.1":
+        raise ValueError(f"get_json: refusing {p.scheme}://{p.hostname}")
+    with urllib.request.urlopen(url, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.load(r)
 
 

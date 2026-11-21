@@ -37,6 +37,9 @@
 # Test seams (env): GBRAIN_DIR GBRAIN_CMD GBRAIN_DOCKER INGEST_LOG STALL_LIMIT_S
 #   WATCHDOG_POLL_S PASS_GAP_S MAX_PASSES INGEST_MISSING_PERMILLE INGEST_CHUNKED_SOURCE_ONLY
 set -u
+# The extension list shared with jobs/nightly-sync.sh's freshness gate (one list: lib/import-exts.sh).
+. "$(dirname "$0")/import-exts.sh"
+export GBRAIN_IMPORT_EXTS
 GB="${GBRAIN_DIR:-$HOME/gbrain}"
 GBRAIN_CMD="${GBRAIN_CMD:-$GB/gbrain}"
 DOCKER="${GBRAIN_DOCKER:-}"
@@ -89,11 +92,12 @@ import os, subprocess, sys, unicodedata
 root, claims, gb = sys.argv[1], sys.argv[2], sys.argv[3]
 PRUNE = {"node_modules", "vendor", "dist", "build", "venv", "ops"}
 SKIP = {"schema.md", "index.md", "log.md", "README.md", "RESOLVER.md"}
+EXTS = tuple("." + e for e in os.environ["GBRAIN_IMPORT_EXTS"].split())   # lib/import-exts.sh
 def ok(rel):
     segs = rel.split("/")
     if any(s in PRUNE or s.endswith(".raw") or s.startswith(".") for s in segs):
         return False
-    if any(ord(c) < 32 for c in rel) or not rel.endswith((".md", ".mdx")):
+    if any(ord(c) < 32 for c in rel) or not rel.endswith(EXTS):
         return False
     if "[" in rel or "]" in rel or segs[-1] in SKIP:
         return False

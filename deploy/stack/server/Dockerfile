@@ -16,12 +16,24 @@
 ARG BUN_IMAGE=oven/bun:1.3.10-debian@sha256:367842b35abbdf23f39e23c71f3a08eee940ff2679a14e08a5afcf4a1436cd89
 FROM ${BUN_IMAGE}
 ARG GBRAIN_REVISION=unknown
+# The non-root user the server (and the cron image built FROM this one) runs as. gbrainctl build passes the host
+# file's stack_uid/stack_gid: the owner of the rendered 0600 secrets and of the brain repo, so a bind-mounted secret
+# is readable and a brain commit keeps the host's ownership on a strict (Linux) runtime too. 10001 = a bare build.
+ARG GBRAIN_UID=10001
+ARG GBRAIN_GID=10001
 
 # git: the import walker lists files with `git ls-files` (src/commands/import.ts); tini: PID 1 reaps the
 # children `serve` and the cron jobs spawn; ca-certificates: OpenAI / DeepInfra TLS.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates tini \
  && rm -rf /var/lib/apt/lists/*
+
+# A passwd entry for the uid (ssh refuses to run without one); -o: the uid/gid may already exist in the base
+# (bun is 1000, dialout is 20). /gbrain (GBRAIN_HOME, the gbrain-home volume) is created owned by it, so a fresh
+# named volume inherits that owner.
+RUN (getent group "${GBRAIN_GID}" >/dev/null || groupadd -g "${GBRAIN_GID}" gbrain) \
+ && useradd -o -u "${GBRAIN_UID}" -g "${GBRAIN_GID}" -d /gbrain -M -s /usr/sbin/nologin gbrain \
+ && install -d -o "${GBRAIN_UID}" -g "${GBRAIN_GID}" -m 0700 /gbrain
 
 WORKDIR /app
 COPY package.json bun.lock bunfig.toml ./
@@ -39,5 +51,6 @@ ENV GBRAIN_REVISION=${GBRAIN_REVISION} \
     GBRAIN_HOME=/gbrain \
     GBRAIN_LINK_RESOLUTION_GLOBAL_BASENAME=1 \
     NODE_ENV=production
+USER ${GBRAIN_UID}:${GBRAIN_GID}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/gbrain-entrypoint"]
 CMD ["serve", "--http", "--port", "8199", "--bind", "0.0.0.0"]

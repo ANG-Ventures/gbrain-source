@@ -31,8 +31,10 @@ rerank_primary       = "http://rerank-tunnel:18084"
 
 # cron
 nas_backup       = true
-cron_uid         = 502                   # owner of ~/gbrain/brain on this host
-cron_gid         = 20
+# the non-root uid:gid EVERY stack image runs as (baked by `gbrainctl build`): the owner of ~/gbrain/brain and the
+# user who runs gbrainctl (so the 0600 rendered secrets it bind-mounts are readable by the same uid on any runtime)
+stack_uid        = 502
+stack_gid        = 20
 gbrain_home      = "~/gbrain"            # GBRAIN_HOME in the cron container; the brain is mounted at <this>/brain
 brain_source     = "~/gbrain/brain"
 git_name         = "Kyzcreig"                                   # the brain repo nightly commits' author (host git config)

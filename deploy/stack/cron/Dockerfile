@@ -22,6 +22,10 @@ ARG RESTIC_SHA256_AMD64=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a2
 ARG SUPERCRONIC_VERSION=v0.2.49
 ARG SUPERCRONIC_SHA256_ARM64=02aa0cb229ba09050cba6638059dadb9eedc2276632ea43d6a57a2f8c1629dd5
 ARG SUPERCRONIC_SHA256_AMD64=a53ae236602c7338aba3fbaff40bda6300eae3b9fedb8261eb06cfe3724430c1
+# The server image's non-root user (stack_uid). The build steps need root; the image runs as that user again.
+ARG GBRAIN_UID=10001
+ARG GBRAIN_GID=10001
+USER root
 
 RUN set -eu; \
     apt-get update; \
@@ -50,7 +54,10 @@ RUN set -eu; \
     curl -fsSLo /usr/local/bin/supercronic \
       "https://github.com/aptible/supercronic/releases/download/${SUPERCRONIC_VERSION}/supercronic-linux-${TARGETARCH}"; \
     echo "${ssha}  /usr/local/bin/supercronic" | sha256sum -c -; \
-    chmod 0755 /usr/local/bin/supercronic
+    chmod 0755 /usr/local/bin/supercronic; \
+    test "$(id -u gbrain)" = "${GBRAIN_UID}"; \
+    usermod -d /state gbrain; \
+    install -d -o "${GBRAIN_UID}" -g "${GBRAIN_GID}" -m 0700 /state
 
 COPY jobs/ /opt/gbrain-cron/jobs/
 COPY lib/ /opt/gbrain-cron/lib/
@@ -65,7 +72,10 @@ RUN chmod 0755 /usr/local/bin/gbrainjob /usr/local/bin/gbrain-cron-entrypoint /u
  && supercronic -test /etc/gbrain/crontab \
  && git config --system safe.directory '*'
 
+# HOME and the passwd home are /state (the cron-state volume, created owned by the uid above): ssh reads
+# ~/.ssh/config from the passwd entry, not $HOME, and restic's sftp backend goes through it.
 ENV GBRAIN_STATE_DIR=/state GBRAIN_SECRETS_DIR=/state/secrets GBRAIN_JOBS_DIR=/opt/gbrain-cron/jobs PGPASSFILE=/state/.pgpass HOME=/state
 WORKDIR /state
+USER ${GBRAIN_UID}:${GBRAIN_GID}
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/gbrain-cron-entrypoint"]
 CMD []

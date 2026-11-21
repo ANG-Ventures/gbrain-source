@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -49,6 +50,26 @@ MAX_QUERY_CHARS = int(os.environ.get("RERANK_MAX_QUERY_CHARS", "2000"))
 FALLBACK_MODEL = "Qwen/Qwen3-Reranker-4B"
 FALLBACK_URL = f"https://api.deepinfra.com/v1/inference/{FALLBACK_MODEL}"
 FALLBACK_TIMEOUT_S = 30
+
+
+def _origin(url: str) -> tuple[str, str]:
+    p = urllib.parse.urlsplit(url)
+    return p.scheme, (p.hostname or "")
+
+
+# The only places this proxy may send a request: the configured primary (RERANK_PRIMARY_BASE, http/https only) and
+# the DeepInfra fallback. A RERANK_PRIMARY_BASE with another scheme (file://, ftp://, ...) stops the proxy at start.
+if _origin(PRIMARY_BASE)[0] not in ("http", "https") or not _origin(PRIMARY_BASE)[1]:
+    sys.exit(f"[rerank-proxy] RERANK_PRIMARY_BASE must be an http(s) URL with a host: {PRIMARY_BASE!r}")
+ALLOWED_ORIGINS = {_origin(PRIMARY_BASE), _origin(FALLBACK_URL)}
+
+
+def _checked_url(url: str) -> str:
+    """url, if its scheme is http/https and its (scheme, host) is the primary's or the fallback's; else ValueError."""
+    o = _origin(url)
+    if o[0] not in ("http", "https") or o not in ALLOWED_ORIGINS:
+        raise ValueError(f"refusing request to {o[0]}://{o[1]}: not the configured primary or the fallback")
+    return url
 OP_REF = "op://p5fyqekdzsdp7rmdk3n4kjecse/DeepInfra/credential"
 
 def _load_key() -> str | None:
@@ -102,10 +123,11 @@ def _alert_once(kind: str, severity: str, body: str) -> None:
 
 def _post(url: str, body: dict, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(
-        url, data=json.dumps(body).encode(),
+        _checked_url(url), data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", **headers},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    # url passed _checked_url above: http(s) and the configured primary or the DeepInfra fallback only
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.load(r)
 
 def _caller(port: int) -> str:
@@ -156,7 +178,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             primary_ok = True
             try:
-                urllib.request.urlopen(f"{PRIMARY_BASE}/health", timeout=4)
+                health = _checked_url(f"{PRIMARY_BASE}/health")   # http(s), the configured primary only
+                urllib.request.urlopen(health, timeout=4)  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
             except Exception:
                 primary_ok = False
             self._respond(200, {

@@ -15,7 +15,8 @@ set -euo pipefail
 GB="${GBRAIN_HOME:?GBRAIN_HOME unset}"
 BRAIN="$GB/brain"
 ST="${GBRAIN_STATE_DIR:-/state}"
-LIB=/opt/gbrain-cron/lib
+LIB="${GBRAIN_CRON_LIB:-/opt/gbrain-cron/lib}"
+. "$LIB/import-exts.sh"
 LOG="$ST/nightly-sync.log"
 STAMP="$ST/last-nightly-sync"
 SKIPS_FILE="$ST/nightly-skips"
@@ -34,11 +35,13 @@ release_audit_lock() {
   [ "$AUDIT_LOCK_HELD" = 1 ] && python3 "$LIB/audit_lock.py" release --path "$AUDIT_LOCK" --pid "$$" --quiet --ok-if-missing 2>>"$LOG" || true
 }
 
-# Anything new under an import root since the last successful run?
+# Anything new under an import root since the last successful run? Every extension the import takes counts.
+NAMES=()
+for e in $GBRAIN_IMPORT_EXTS; do NAMES+=(${NAMES[@]:+-o} -name "*.$e"); done
 NEW=""
 for R in $ROOTS; do
   if [ -d "$BRAIN/$R" ]; then
-    NEW=$(find "$BRAIN/$R" -name "*.md" -newer "$STAMP" 2>/dev/null | head -1 || true)
+    NEW=$(find "$BRAIN/$R" \( "${NAMES[@]}" \) -newer "$STAMP" 2>/dev/null | head -1 || true)
     [ -n "$NEW" ] && break
   fi
 done

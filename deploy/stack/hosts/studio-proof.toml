@@ -31,8 +31,8 @@ rerank_tunnel_target = "none"
 rerank_primary       = "http://host.docker.internal:18084"
 
 nas_backup       = false
-cron_uid         = 502
-cron_gid         = 20
+stack_uid        = 502                   # see hosts/studio.toml
+stack_gid        = 20
 gbrain_home      = "~/gbrain"                      # same container path as studio (source_ref match) ...
 brain_source     = "~/gbrain-stack-proof/brain"    # ... but the mount is an APFS clone (cp -c) of ~/gbrain/brain
 git_name         = "Kyzcreig"                                   # the brain repo nightly commits' author (host git config)

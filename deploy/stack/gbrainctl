@@ -12,8 +12,10 @@ lib/mem0ctl/{render,compose,up}.py), one stdlib-only file (python >= 3.11 for to
                                           host file's `revision` (never the caller's tree), for the host's arch
   gbrainctl status  --host H              compose ps + each running container's revision label vs the pin
 
-Refusals: `up`/`down` on the production project (`gbrain`) need --allow-prod. compose refuses an env file without
-the RENDERED header, and caller args that start with a global flag (they would override -p / --env-file).
+Refusals: on the production project (`gbrain`) `up`, `down` and every `compose` subcommand that is not read-only
+(anything outside READ_ONLY_COMPOSE: down, stop, rm, restart, kill, up, exec, run, ...) need --allow-prod.
+compose refuses an env file without the RENDERED header, and caller args that start with a global flag (they would
+override -p / --env-file).
 Secrets never reach argv, stdout or an exception: a value is only written to a 0600 file.
 Last line of render: RENDER=ok host=<h> keys=<n> files=<m> changed=<k> skipped=<features off>.
 """
@@ -36,6 +38,9 @@ STACK_REPO = Path(__file__).resolve().parent                 # deploy/stack in t
 SCHEMA = STACK_REPO / "env.schema.toml"
 HOSTS = STACK_REPO / "hosts"
 PROD_PROJECT = "gbrain"
+# compose subcommands that only read state: free on prod. Default-deny: any other verb (and any verb compose adds
+# later) needs --allow-prod on the production project.
+READ_ONLY_COMPOSE = frozenset({"ps", "config", "logs", "images", "top", "port", "ls", "version"})
 HEADER_RE = re.compile(r"^# RENDERED by gbrainctl (\S+) schema=(\S+) from hosts/(\S+)\.toml; do not edit$")
 PLACEHOLDER_RE = re.compile(r"<[^<>]+>")
 SAFE_VALUE_RE = re.compile(r"[A-Za-z0-9_./:,@+=%-]*")
@@ -228,7 +233,10 @@ def write_private(path: Path, data: bytes) -> bool:
     except FileNotFoundError:
         pass
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    # The dir holding .env / secrets/*: owner-only (rwx for the owner is what a directory needs to be listed and
+    # written; nobody else may list it). mkdir's mode does not apply to a dir that already exists, hence the chmod.
+    # The files themselves are 0600 (os.open below, and the chmod on the unchanged path above).
+    os.chmod(path.parent, 0o700)  # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     tmp = path.with_name(f".{path.name}.gbrainctl-tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -300,6 +308,9 @@ def cmd_compose(a, rest) -> int:
     h, stack = target(a)
     if not rest:
         die("usage: gbrainctl compose --host <name> -- <compose args>", 64)
+    if h["compose_project"] == PROD_PROJECT and not a.allow_prod and rest[0] not in READ_ONLY_COMPOSE:
+        die(f"refusing `compose {rest[0]}` on the production project {PROD_PROJECT!r} without --allow-prod "
+            f"(read-only without it: {', '.join(sorted(READ_ONLY_COMPOSE))})", 3)
     return run_compose(h, stack, rest).returncode
 
 
@@ -325,8 +336,10 @@ def cmd_build(a) -> int:
     run = lambda *c, **kw: subprocess.run(list(c), check=True, **kw)  # noqa: E731
     try:
         run("git", "-C", str(repo), "worktree", "add", "--detach", str(wt), rev)
+        # GBRAIN_UID/GID: the non-root user every image runs as, baked at build (see the Dockerfiles).
         base = ["docker", "buildx", "build", "--platform", f"linux/{arch}", "--load",
-                "--build-arg", f"GBRAIN_REVISION={rev}"]
+                "--build-arg", f"GBRAIN_REVISION={rev}",
+                "--build-arg", f"GBRAIN_UID={int(h['stack_uid'])}", "--build-arg", f"GBRAIN_GID={int(h['stack_gid'])}"]
         run(*base, "-f", str(wt / "deploy/stack/server/Dockerfile"), "-t", h["server_image"], str(wt))
         run(*base, "-f", str(wt / "deploy/stack/rerank/Dockerfile"), "-t", h["rerank_image"],
             str(wt / "deploy/stack/rerank"))
@@ -343,17 +356,21 @@ def cmd_build(a) -> int:
 
 def cmd_status(a) -> int:
     h, stack = target(a)
-    r = run_compose(h, stack, ["ps", "--format", "{{.Name}} {{.Image}} {{.Status}}"], capture=True)
-    bad = 0
-    for line in r.stdout.splitlines():
-        name = line.split()[0]
-        lab = subprocess.run(["docker", "inspect", name, "--format",
-                              '{{index .Config.Labels "org.opencontainers.image.revision"}}'],
-                             capture_output=True, text=True).stdout.strip()
-        ok = lab in ("", h["revision"]) or "pgvector" in line   # postgres is an upstream image (no label)
+    r = run_compose(h, stack, ["ps", "--format", "{{.Name}} {{.Service}} {{.Image}} {{.Status}}"], capture=True)
+    rows = [line.split(None, 2) for line in r.stdout.splitlines() if line.strip()]
+    bad = 0 if r.returncode == 0 and rows else 1     # a failed `compose ps`, or no container at all, is not ok
+    if r.returncode != 0:
+        print(f"compose ps failed rc={r.returncode}: {(r.stderr or '').strip()[-200:]}")
+    for name, svc, rest in rows:
+        i = subprocess.run(["docker", "inspect", name, "--format",
+                            '{{index .Config.Labels "org.opencontainers.image.revision"}}'],
+                           capture_output=True, text=True)
+        lab = i.stdout.strip() if i.returncode == 0 else ""
+        # postgres is the upstream pgvector image (no revision label); every stack-built service must carry the pin
+        ok = i.returncode == 0 and (svc == "postgres" or lab == h["revision"])
         bad += 0 if ok else 1
-        print(f"{line}  revision={lab or '-'}{'' if ok else '  != pin ' + h['revision'][:12]}")
-    print(f"STATUS={'ok' if bad == 0 and r.returncode == 0 else 'drift'} project={h['compose_project']}")
+        print(f"{name} {svc} {rest}  revision={lab or '-'}{'' if ok else '  != pin ' + h['revision'][:12]}")
+    print(f"STATUS={'ok' if bad == 0 else 'drift'} project={h['compose_project']}")
     return 0 if bad == 0 else 1
 
 
