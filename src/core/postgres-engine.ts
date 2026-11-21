@@ -107,6 +107,7 @@ import * as salienceImpl from './postgres-engine/salience.ts';
 import type { PgSalienceDeps } from './postgres-engine/salience.ts';
 import { hasCJK } from './cjk.ts';
 import { searchKeywordCJK as searchKeywordCJKImpl } from './postgres-engine/cjk-search.ts';
+import { configSnapshot } from './postgres-engine/config-snapshot-cache.ts';
 import type { CjkKeywordCtx } from './search/cjk-keyword-sql.ts';
 
 function escapeSqlStringLiteral(value: string): string {
@@ -5376,14 +5377,14 @@ export class PostgresEngine implements BrainEngine {
         INSERT INTO config (key, value) VALUES (${key}, ${value})
         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
       `;
-    });
+    }).finally(() => configSnapshot(this).drop());
   }
 
   async unsetConfig(key: string): Promise<number> {
     return this.connRetry(async () => {
       const result = await this.sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
       return result.count ?? 0;
-    });
+    }).finally(() => configSnapshot(this).drop());
   }
 
   async listConfigKeys(prefix: string): Promise<string[]> {
@@ -5400,14 +5401,12 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async getAllConfig(): Promise<Record<string, string>> {
-    return this.connRetry(async () => {
-      const rows = await this.sql<{ key: string; value: string }[]>`
-        SELECT key, value FROM config
-      `;
+    return configSnapshot(this).get(() => this.connRetry(async () => { // in-process TTL cache (t_209422a7)
+      const rows = await this.sql<{ key: string; value: string }[]>`SELECT key, value FROM config`;
       const out: Record<string, string> = {};
       for (const row of rows) out[row.key] = row.value;
       return out;
-    });
+    }));
   }
 
   // Migration support
