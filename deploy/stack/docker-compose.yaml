@@ -109,6 +109,10 @@ services:
 
   cron:
     image: "${GBRAIN_CRON_IMAGE:?GBRAIN_CRON_IMAGE unset (run gbrainctl render)}"
+    # A stable hostname: restic locks carry it, and `restic unlock` only clears a dead-PID lock from its OWN
+    # hostname. With the default (the container id) a restic killed in a replaced container blocked the next
+    # `forget` until the lock aged 30 min (proof, 2026-11-20: pg-backup failed on exactly that).
+    hostname: "${GBRAIN_PROJECT}-cron"
     pull_policy: never
     restart: unless-stopped
     depends_on:
