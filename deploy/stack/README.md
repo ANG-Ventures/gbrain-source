@@ -65,8 +65,9 @@ Final images: `422c0550` (same app code). Measured 2026-11-20 22:02-23:05 PT:
 | same, with the proof's `query_cache` emptied (62,204 rows -> 0) so every proof search is computed fresh (1.1-5.7 s each), final images | 20/20 identical |
 | a second set of 20 newer turns | 20/20 identical |
 | health | server `/health` `{"status":"ok","engine":"postgres"}`, rerank-proxy `primary_ok: true`, `gbrainctl status` STATUS=ok |
-| nightly-sync, once (99aa9fca image) | ok, 10 roots, 84 pages updated, brain clone committed; 1,560 s, of which ~20 min was one `git add -A` re-hashing an APFS clone whose mtimes all changed (proof artefact; see the git stat row) |
-| pg-backup, once, into a scratch restic repo | ok, 30.05 GB plain SQL in 196 s (cron at 2 cpus for the run), `restic dump` header `Dumped from 16.14 / by pg_dump 16.16` |
+| nightly-sync (99aa9fca image) | ok, 10 roots, 84 pages updated, brain clone committed; 1,560 s, of which ~20 min was one `git add -A` re-hashing an APFS clone whose mtimes all changed (proof artefact; see the git stat row) |
+| nightly-sync again (422c0550, minimal stat checks, a probe page added to the clone) | ok in 411 s; the probe page is in the proof DB; commit authored by the host identity |
+| pg-backup into a scratch restic repo | ok, 30.05 GB plain SQL in 196 s (cron at 2 cpus for the run), `restic dump` header `Dumped from 16.14 / by pg_dump 16.16`. Second run FAILED at `forget`: a lock left by a SIGPIPE'd `restic dump` in the previous (recreated) container, whose hostname differed, so `unlock` could not clear it before it aged 30 min. Fix: a stable cron `hostname` (98066431). Third run ok in 102 s, 3.3 MB added |
 | deploy-parity, once | ok; with a wrong pin it fails naming both revisions |
 | one cron per database | a second cron container exits 1 `another gbrain cron container holds this database's instance lock`; after a DB restart the cron container exits within 30 s and re-takes the lock (RestartCount 1) |
 | git over the bind mount (live repo, read-only, `--no-optional-locks`) | container default stat checks 481 s, container `core.checkStat=minimal` 14 s, host native 3 s |
