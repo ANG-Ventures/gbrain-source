@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+# SCHEDULE: manual (called by the hermes-home cron row that replaces gbrain-deploy-parity; README "Cutover" step 7)
+"""gbrain-stack-watch: the host-side monitor for the gbrain compose stack (card t_ab2fcba3). stdlib only.
+
+  gbrain-stack-watch --host studio [--stack-dir DIR] [--no-github]
+
+The checks that need the docker socket or the host's GitHub credentials, i.e. what the in-container jobs cannot see:
+  1. every running service of the project carries org.opencontainers.image.revision == hosts/<h>.toml `revision`
+     (postgres is the upstream pgvector image and is checked by name + health instead)
+  2. that pin == ANG-Ventures/gbrain-source master (`git ls-remote`; --no-github skips; the launchd-era
+     gbrain-deploy-parity.sh check 1, now on the image instead of ~/gbrain/app)
+  3. no stack container bind-mounts application code (the old live-checkout coupling): the only binds allowed are
+     the brain repo, the receipts dir and the backup stamp dir
+  4. server /health on the published port says engine=postgres; rerank-proxy /health says primary_ok=true (false =
+     the DeepInfra fallback is engaged: the page the launchd proxy sent itself through ~/.hermes/scripts/notify)
+  5. each cron job's latest result line in <receipts_dir>/<job>.json is ok and not older than its period + grace
+     (only once the stack is armed: <receipts_dir>/ARMED-AT exists, written by the cutover)
+Silent + exit 0 when green. Findings on stdout + exit 1 (a no_agent cron row delivers stdout to #alerts).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PERIOD_GRACE_S = {"nightly-sync": 86400 + 6 * 3600, "pg-backup": 86400 + 6 * 3600, "deploy-parity": 86400 + 6 * 3600}
+
+
+def sh(*cmd, timeout=30):
+    r = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout.strip()
+
+
+def get_json(url, timeout=8):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", required=True)
+    ap.add_argument("--no-github", action="store_true")
+    a = ap.parse_args()
+    h = tomllib.loads((HERE / "hosts" / f"{a.host}.toml").read_text())
+    proj, pin = h["compose_project"], h["revision"]
+    out: list[str] = []
+    rc, names = sh("docker", "ps", "--filter", f"label=com.docker.compose.project={proj}", "--format", "{{.Names}}")
+    running = names.split() if rc == 0 else []
+    if rc != 0:
+        out.append("docker ps failed: the stack is BLIND")
+    for svc in ("postgres", "server", "rerank-proxy", "cron"):
+        rc, ids = sh("docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={proj}",
+                     "--filter", f"label=com.docker.compose.service={svc}")
+        if not ids:
+            out.append(f"service {svc} NOT RUNNING in project {proj}")
+            continue
+        cid = ids.split()[0]
+        _, info = sh("docker", "inspect", cid, "--format",
+                     '{{index .Config.Labels "org.opencontainers.image.revision"}}|{{json .Mounts}}')
+        lab, _, mounts = info.partition("|")
+        if svc != "postgres" and lab != pin:
+            out.append(f"{svc} runs revision {lab or '-'} != pinned {pin[:12]} (gbrainctl build + up)")
+        allowed = {"/receipts", "/backup-stamps", f"{os.path.expanduser(h['gbrain_home'])}/brain"}
+        for m in json.loads(mounts or "[]"):
+            if m.get("Type") == "bind" and m.get("Destination") not in allowed and not m.get(
+                    "Destination", "").startswith("/run/secrets"):
+                out.append(f"{svc} bind-mounts {m.get('Source')} -> {m.get('Destination')} (no code mounts)")
+    if not a.no_github:
+        rc, ls = sh("git", "ls-remote", "https://github.com/ANG-Ventures/gbrain-source.git", "refs/heads/master",
+                    timeout=60)
+        master = ls.split()[0] if rc == 0 and ls else ""
+        if not master:
+            out.append("git ls-remote gbrain-source master FAILED: parity unknown")
+        elif master != pin:
+            out.append(f"pin {pin[:12]} != gbrain-source master {master[:12]}: land a hosts/{a.host}.toml pin PR, "
+                       f"gbrainctl build, gbrainctl up")
+    try:
+        hj = get_json(f"http://127.0.0.1:{h['ports']['serve']}/health")
+        if hj.get("engine") != "postgres" or hj.get("status") != "ok":
+            out.append(f"server /health not ok: {json.dumps(hj)[:200]}")
+    except Exception as e:
+        out.append(f"server /health no answer: {type(e).__name__}")
+    try:
+        rj = get_json(f"http://127.0.0.1:{h['ports']['rerank']}/health")
+        if not rj.get("primary_ok"):
+            out.append("rerank primary (zerank-2 on the reranker host) unreachable: searches run on the DeepInfra "
+                       f"fallback (fallback_armed={rj.get('fallback_armed')}); check zerank-native + rerank-tunnel")
+    except Exception as e:
+        out.append(f"rerank-proxy /health no answer: {type(e).__name__}")
+    rd = Path(os.path.expanduser(h["receipts_dir"]))
+    if (rd / "ARMED-AT").exists():
+        armed = (rd / "ARMED-AT").stat().st_mtime
+        for job, grace in PERIOD_GRACE_S.items():
+            p = rd / f"{job}.json"
+            if not p.exists():
+                if time.time() - armed > grace:
+                    out.append(f"cron job {job}: no result since the stack was armed")
+                continue
+            r = json.loads(p.read_text())
+            if r.get("result") != "ok":
+                out.append(f"cron job {job} {r.get('result')} rc={r.get('rc')} at {r.get('ended')}: "
+                           + " | ".join((r.get("tail") or [])[-3:])[:400])
+            elif time.time() - p.stat().st_mtime > grace:
+                out.append(f"cron job {job}: last ok result is older than {grace // 3600} h")
+    if not out:
+        return 0
+    print(f"⚠️ gbrain stack {proj} ({time.strftime('%Y-%m-%d %H:%M %Z')}):")
+    for line in out:
+        print(f"  {line}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

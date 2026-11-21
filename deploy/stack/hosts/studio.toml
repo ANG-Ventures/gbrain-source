@@ -7,10 +7,13 @@ arch            = "arm64"
 docker_host_gw  = "host.docker.internal"   # OrbStack name for the host loopback (mem0's hosts/studio.toml)
 
 # the build every container of this host runs: ANG-Ventures/gbrain-source commit, built per arch by `gbrainctl build`
-revision        = "9bd1cfebb31a349484d30edd665a30f9b834b686"   # = master and the launchd serve's ~/gbrain/app HEAD, 2026-11-20
-server_image    = "gbrain-server:9bd1cfebb31a-arm64"
-rerank_image    = "gbrain-rerank:9bd1cfebb31a-arm64"
-cron_image      = "gbrain-cron:9bd1cfebb31a-arm64"
+# Set by the cutover's pin PR to the master commit that carries deploy/stack (the merge of card t_ab2fcba3's PR).
+# The app code must equal what the launchd serve runs (~/gbrain/app HEAD 9bd1cfeb on 2026-11-20). Until then the
+# placeholder makes `gbrainctl render/build --host studio` refuse, so prod cannot start from an unpinned build.
+revision        = "<master sha that carries deploy/stack>"
+server_image    = "gbrain-server:<sha12>-arm64"
+rerank_image    = "gbrain-rerank:<sha12>-arm64"
+cron_image      = "gbrain-cron:<sha12>-arm64"
 
 # compose (the checkout `gbrainctl` runs from is the deploy tree; compose files are relative to deploy/stack)
 compose_project = "gbrain"

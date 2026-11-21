@@ -216,6 +216,7 @@ def show(job: str | None) -> int:
 
 
 def main(argv: list[str]) -> int:
+    os.umask(0o022)          # supercronic / docker exec start jobs with umask 0: no world-writable state files
     if not argv:
         print(__doc__)
         return 64
