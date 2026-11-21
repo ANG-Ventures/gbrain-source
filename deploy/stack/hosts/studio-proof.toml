@@ -13,10 +13,10 @@ os              = "darwin"
 arch            = "arm64"
 docker_host_gw  = "host.docker.internal"
 
-revision        = "422c0550758c5e26131cc2511dacde7c31c07a70"   # this branch: master 9bd1cfeb + deploy/stack only (app code identical)
-server_image    = "gbrain-server:422c0550758c-arm64"
-rerank_image    = "gbrain-rerank:422c0550758c-arm64"
-cron_image      = "gbrain-cron:422c0550758c-arm64"
+revision        = "b63f3b39c54a7327a7cbfdaec94aab3852ade621"   # this branch after round 1: master 9bd1cfeb + deploy/stack only (app code identical)
+server_image    = "gbrain-server:b63f3b39c54a-arm64"
+rerank_image    = "gbrain-rerank:b63f3b39c54a-arm64"
+cron_image      = "gbrain-cron:b63f3b39c54a-arm64"
 
 compose_project = "gbrain-proof"
 compose_files   = ["docker-compose.yaml", "docker-compose.studio.yaml", "docker-compose.proof.yaml"]
