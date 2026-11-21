@@ -1,0 +1,34 @@
+# deploy/stack/docker-compose.studio.yaml: the Mac Studio overlay (card t_ab2fcba3). Loaded by hosts/studio.toml and
+# hosts/studio-proof.toml (the side-by-side proof on the same box). arm64 images, and a cpu AND memory limit on every
+# service: the home repo's fleet-container-reaper/orbstack-policy refuses unbounded containers in the VM
+# (t_2c886bf2, `required-orbstack-cap`), and prod is counted against prod_reserve_cores / prod_reserve_mib.
+#   postgres  2.0 / 14g / shm 8407482368 B: what the LIVE hand-run gbrain-pg container runs with (`docker inspect`
+#             2026-11-20: NanoCpus 2e9, Memory 15032385536, ShmSize 8407482368; ANG-Ventures/gbrain
+#             deploy/gbrain-pg/docker-compose.yml says 10g / 2g but its cutover never ran: the container carries no
+#             compose label). Cutover keeps the live values; shrinking them is a separate, measured change.
+#   server    4.0 / 4g: the launchd serve ran unbounded at RSS 327 MiB idle (ps, 2026-11-20 21:4x PT); the proof
+#             measures it under the 20-query set and the nightly import (README "Measured").
+#   rerank-*  stdlib python proxy and an ssh client: 0.5 / 256m and 0.25 / 64m.
+#   cron      2.0 / 4g: the nightly import runs bun `gbrain import` + embeddings in this container.
+services:
+  postgres:
+    platform: linux/arm64
+    cpus: 2.0
+    mem_limit: 14g
+    shm_size: 8407482368
+  server:
+    platform: linux/arm64
+    cpus: 4.0
+    mem_limit: 4g
+  rerank-proxy:
+    platform: linux/arm64
+    cpus: 0.5
+    mem_limit: 256m
+  rerank-tunnel:
+    platform: linux/arm64
+    cpus: 0.25
+    mem_limit: 64m
+  cron:
+    platform: linux/arm64
+    cpus: 2.0
+    mem_limit: 4g

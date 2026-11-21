@@ -1,0 +1,10 @@
+.git
+**/node_modules
+bin
+test
+tests
+evals
+deploy/stack/hosts
+deploy/stack/.env
+deploy/stack/secrets
+**/__pycache__

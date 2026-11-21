@@ -1,0 +1,192 @@
+# deploy/stack/docker-compose.yaml: the whole of gbrain as one compose project (card t_ab2fcba3).
+#
+#   postgres       pgvector pg16, the EXISTING data volume (external: compose never creates or deletes it), its
+#                  tuning in $PGDATA/postgresql.auto.conf (travels with the volume: shared_buffers 6GB, work_mem 32MB,
+#                  maintenance_work_mem 1GB, pg_stat_statements, ...). Replaces ANG-Ventures/gbrain deploy/gbrain-pg.
+#   server         gbrain serve --http (MCP + OAuth) from the server image built from a commit. No source mount.
+#   rerank-proxy   zerank-2 primary, DeepInfra fallback; the server's provider_base_urls points here.
+#   rerank-tunnel  (profile `tunnel`) ssh -L to zerank-native on the reranker host. A host that already has a
+#                  reranker path (the proof profile reuses the live host tunnel) leaves the profile off.
+#   cron           supercronic + gbrainjob: nightly-sync, pg-backup, deploy-parity. ONE per database (it holds a DB
+#                  advisory lock for its lifetime), and inert until /state/ARMED exists.
+#
+# Never run bare `docker compose` here: `gbrainctl compose --host <h> -- <args>` passes the rendered --env-file,
+# -p and every -f from hosts/<h>.toml, with a clean environment (mem0ctl's P2 rule). Every ${VAR} below comes from
+# that rendered .env; secrets are FILES under ./secrets (gbrainctl render, from 1Password), granted per service.
+name: "${GBRAIN_PROJECT:?GBRAIN_PROJECT unset (run gbrainctl render)}"
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 20m
+    max-file: "5"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    container_name: "${GBRAIN_PG_CONTAINER:?GBRAIN_PG_CONTAINER unset (run gbrainctl render)}"
+    restart: unless-stopped
+    shm_size: 2g
+    environment:
+      POSTGRES_DB: gbrain
+      POSTGRES_USER: gbrain
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg-password
+    secrets:
+      - pg-password
+    ports:
+      - "127.0.0.1:${GBRAIN_PG_PORT:?GBRAIN_PG_PORT unset}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    logging: *logging
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U gbrain -d gbrain"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+  server:
+    image: "${GBRAIN_SERVER_IMAGE:?GBRAIN_SERVER_IMAGE unset (run gbrainctl render)}"
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rerank-proxy:
+        condition: service_started
+    environment:
+      GBRAIN_PG_HOST: postgres
+      GBRAIN_PG_PORT: "5432"
+      ANTHROPIC_BASE_URL: "${GBRAIN_ANTHROPIC_BASE_URL:?GBRAIN_ANTHROPIC_BASE_URL unset}"
+      GBRAIN_ZEMBED_DAYTIME_ENABLED: "true"
+    secrets:
+      - openai-key
+      - anthropic-key
+      - pg-password
+      - config.json
+    volumes:
+      - gbrain-home:/gbrain
+    ports:
+      - "127.0.0.1:${GBRAIN_SERVE_PORT:?GBRAIN_SERVE_PORT unset}:8199"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8199/health').then(r=>r.json()).then(j=>process.exit(j.status==='ok'?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  rerank-proxy:
+    image: "${GBRAIN_RERANK_IMAGE:?GBRAIN_RERANK_IMAGE unset (run gbrainctl render)}"
+    pull_policy: never
+    restart: unless-stopped
+    environment:
+      RERANK_PRIMARY_BASE: "${GBRAIN_RERANK_PRIMARY:?GBRAIN_RERANK_PRIMARY unset}"
+      RERANK_LISTEN: "0.0.0.0:18085"
+      DEEPINFRA_KEY_FILE: /run/secrets/deepinfra-key
+      RERANK_NOTIFY_CMD: /bin/true
+    secrets:
+      - deepinfra-key
+    ports:
+      - "127.0.0.1:${GBRAIN_RERANK_PORT:?GBRAIN_RERANK_PORT unset}:18085"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *logging
+
+  rerank-tunnel:
+    profiles: ["tunnel"]
+    image: "${GBRAIN_RERANK_IMAGE}"
+    pull_policy: never
+    restart: unless-stopped
+    command: ["/opt/gbrain-rerank/tunnel.sh"]
+    environment:
+      RERANK_TUNNEL_TARGET: "${GBRAIN_RERANK_TUNNEL_TARGET:-}"
+    secrets:
+      - tunnel-ssh-key
+      - tunnel-known-hosts
+    logging: *logging
+
+  cron:
+    image: "${GBRAIN_CRON_IMAGE:?GBRAIN_CRON_IMAGE unset (run gbrainctl render)}"
+    # A stable hostname: restic locks carry it, and `restic unlock` only clears a dead-PID lock from its OWN
+    # hostname. With the default (the container id) a restic killed in a replaced container blocked the next
+    # `forget` until the lock aged 30 min (proof, 2026-11-20: pg-backup failed on exactly that).
+    hostname: "${GBRAIN_PROJECT}-cron"
+    pull_policy: never
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      TZ: "${GBRAIN_CRON_TZ:-America/Los_Angeles}"
+      GBRAIN_HOST_NAME: "${GBRAIN_HOST_NAME:?GBRAIN_HOST_NAME unset}"
+      GBRAIN_HOME: "${GBRAIN_HOST_HOME:?GBRAIN_HOST_HOME unset}"
+      GBRAIN_EXPECTED_REVISION: "${GBRAIN_REVISION:?GBRAIN_REVISION unset}"
+      GBRAIN_SERVE_URL: http://server:8199
+      GBRAIN_PG_HOST: postgres
+      GBRAIN_PG_PORT: "5432"
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: gbrain
+      PGDATABASE: gbrain
+      ANTHROPIC_BASE_URL: "${GBRAIN_ANTHROPIC_BASE_URL}"
+      GBRAIN_RESTIC_REPO: "${GBRAIN_RESTIC_REPO:?GBRAIN_RESTIC_REPO unset}"
+      GBRAIN_RESTIC_HOST: "${GBRAIN_RESTIC_HOST:?GBRAIN_RESTIC_HOST unset}"
+      GBRAIN_RESTIC_INIT_OK: "${GBRAIN_RESTIC_INIT_OK:-0}"
+      GBRAIN_RECEIPTS_DIR: /receipts
+      GBRAIN_GIT_NAME: "${GBRAIN_GIT_NAME:?GBRAIN_GIT_NAME unset}"
+      GBRAIN_GIT_EMAIL: "${GBRAIN_GIT_EMAIL:?GBRAIN_GIT_EMAIL unset}"
+      GBRAIN_BACKUP_STAMP_DIR: /backup-stamps
+    secrets:
+      - openai-key
+      - anthropic-key
+      - pg-password
+      - config.json
+      - restic-password
+      - nas-ssh-key
+      - nas-known-hosts
+    # The image runs as the non-root stack uid (GBRAIN_UID). <gbrain_home>/.gbrain (gbrain's config dir) sits under a
+    # path docker creates as root for the brain bind below, so it is a tmpfs owned by that uid; the entrypoint
+    # re-copies config.json into it on every start and every `gbrain` call.
+    tmpfs:
+      - "${GBRAIN_HOST_HOME}/.gbrain:uid=${GBRAIN_UID:?GBRAIN_UID unset},gid=${GBRAIN_GID:?GBRAIN_GID unset},mode=0700"
+    volumes:
+      - cron-state:/state
+      # the brain repo, mounted at <gbrain_home>/brain = the HOST path the launchd job imported from:
+      # ingest_log.source_ref holds that absolute root and ingest-chunked's readback compares against it
+      - "${GBRAIN_BRAIN_SOURCE:?GBRAIN_BRAIN_SOURCE unset}:${GBRAIN_HOST_HOME}/brain"
+      - "${GBRAIN_RECEIPTS_DIR:?GBRAIN_RECEIPTS_DIR unset}:/receipts"
+      - "${GBRAIN_BACKUP_STAMP_DIR:?GBRAIN_BACKUP_STAMP_DIR unset}:/backup-stamps"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *logging
+
+secrets:
+  openai-key:
+    file: ./secrets/openai-key
+  anthropic-key:
+    file: ./secrets/anthropic-key
+  pg-password:
+    file: ./secrets/pg-password
+  config.json:
+    file: ./secrets/config.json
+  deepinfra-key:
+    file: ./secrets/deepinfra-key
+  restic-password:
+    file: ./secrets/restic-password
+  nas-ssh-key:
+    file: ./secrets/nas-ssh-key
+  nas-known-hosts:
+    file: ./secrets/nas-known-hosts
+  tunnel-ssh-key:
+    file: ./secrets/tunnel-ssh-key
+  tunnel-known-hosts:
+    file: ./secrets/tunnel-known-hosts
+
+volumes:
+  pgdata:
+    name: "${GBRAIN_PG_VOLUME:?GBRAIN_PG_VOLUME unset}"
+    external: true
+  gbrain-home:
+  cron-state:

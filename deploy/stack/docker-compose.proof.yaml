@@ -1,0 +1,19 @@
+# deploy/stack/docker-compose.proof.yaml: the side-by-side proof's limits (hosts/studio-proof.toml only; card
+# t_ab2fcba3). The proof runs BESIDE production in the same OrbStack VM, so it is a non-prod stack under the home
+# repo's admission rule (fleet-container-reaper.py --admit gbrain-proof: drill stacks get at most 3 cores; memory
+# within memory_mib - prod_reserve_mib). Caps here are ceilings for the proof only; the proof READS the stack's
+# real usage (docker stats) and the answers, not latency under these caps. Production uses docker-compose.studio.yaml.
+services:
+  postgres:
+    cpus: 1.0
+    mem_limit: 8g
+    shm_size: 1g
+  server:
+    cpus: 1.0
+    mem_limit: 2g
+  rerank-proxy:
+    cpus: 0.25
+    mem_limit: 256m
+  cron:
+    cpus: 0.5
+    mem_limit: 2g

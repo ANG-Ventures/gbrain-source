@@ -1,0 +1,46 @@
+# hosts/studio-proof.toml: the side-by-side PROOF on the Mac Studio (card t_ab2fcba3): the same images and overlay as
+# hosts/studio.toml, beside the live launchd service, on other ports, against a COPY of the database
+# (pg_basebackup of gbrain-pg into gbrain-pgdata-proof), so production is never touched. Differences from studio:
+#   project gbrain-proof, container gbrain-proof-pg, volume gbrain-pgdata-proof, ports 15433 / 18299 / 18185
+#   rerank: no tunnel; the proxy's primary is the LIVE host tunnel (127.0.0.1:18084 via host.docker.internal),
+#           i.e. the same zerank-native the live serve reaches
+#   brain: an APFS clone of ~/gbrain/brain mounted at the same container path, so the proof's nightly-sync commits
+#          into the clone, never the live brain repo
+#   backup: a scratch restic repo on the cron state volume (initialised by the job), never the NAS repo
+#   receipts: a scratch dir, never the fleet backup stamp
+name            = "studio-proof"
+os              = "darwin"
+arch            = "arm64"
+docker_host_gw  = "host.docker.internal"
+
+revision        = "fe172fe076f1e14e3e235874d9f8418f18a8e590"   # this branch after round 1: master 9bd1cfeb + deploy/stack only (app code identical)
+server_image    = "gbrain-server:fe172fe076f1-arm64"
+rerank_image    = "gbrain-rerank:fe172fe076f1-arm64"
+cron_image      = "gbrain-cron:fe172fe076f1-arm64"
+
+compose_project = "gbrain-proof"
+compose_files   = ["docker-compose.yaml", "docker-compose.studio.yaml", "docker-compose.proof.yaml"]
+stack_dir       = "~/gbrain-stack-proof/deploy/stack"
+pg_container    = "gbrain-proof-pg"
+pg_volume       = "gbrain-pgdata-proof"
+ports           = { pg = 15433, serve = 18299, rerank = 18185 }
+relay_ports     = { anthropic = 18810 }
+
+rerank_tunnel        = false
+rerank_tunnel_target = "none"
+rerank_primary       = "http://host.docker.internal:18084"
+
+nas_backup       = false
+stack_uid        = 502                   # see hosts/studio.toml
+stack_gid        = 20
+gbrain_home      = "~/gbrain"                      # same container path as studio (source_ref match) ...
+brain_source     = "~/gbrain-stack-proof/brain"    # ... but the mount is an APFS clone (cp -c) of ~/gbrain/brain
+git_name         = "Kyzcreig"                                   # the brain repo nightly commits' author (host git config)
+git_email        = "9063726+Kyzcreig@users.noreply.github.com"
+receipts_dir     = "~/gbrain-stack-proof/receipts"
+backup_stamp_dir = "~/gbrain-stack-proof/receipts"
+restic           = { repo = "/state/proof-restic", host = "mac-studio-m3u", init_ok = 1 }
+
+op_reader       = "~/.hermes/scripts/op-cached-read"
+op_bin          = "/opt/homebrew/bin/op"
+op_token_file   = "~/.hermes/.op-service-token"
