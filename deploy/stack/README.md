@@ -18,7 +18,11 @@ keep `127.0.0.1:5433`, `gbrain-restore-drill.sh` keeps finding `gbrain-pg` snaps
 Files (mem0-selfhost-deploy's shapes, read its `bin/mem0ctl`, `hosts/*.toml`, `scripts/prod_recreate.sh`):
 
 * `gbrainctl` render / compose / up / down / build / status. stdlib python >= 3.11 (`python3.14 ./gbrainctl` on
-  the Studio; the login `python3` there may be Xcode's 3.9).
+  the Studio; the login `python3` there may be Xcode's 3.9). On project `gbrain`, `up`, `down` and every `compose`
+  subcommand except the read-only ones (ps, config, logs, images, top, port, ls, version) need `--allow-prod`.
+* All three images run as one non-root user, `hosts/<h>.toml` `stack_uid:stack_gid` (Studio 502:20: the owner of
+  `~/gbrain/brain` and the user who renders the 0600 secrets), baked in by `gbrainctl build`. Nothing in the stack
+  starts as root except the upstream postgres image. The cron's `<gbrain_home>/.gbrain` is a tmpfs owned by that uid.
 * `env.schema.toml` every `.env` key and every secret FILE, with its 1Password ref. `hosts/<name>.toml` the only
   place a host IP, port or path lives. `stack/.env` and `secrets/*` are build outputs (0600, gitignored).
 * `docker-compose.yaml` + `docker-compose.studio.yaml` (arm64, limits = the live container's) +
@@ -180,7 +184,7 @@ gbrain-ops skill (prose route, hermes-skills PR):
 * "Layout & invariants": the serve runs from the `gbrain-server` image, not `~/gbrain/app`; `~/gbrain/app` stays
   only as the launcher CLI's tree (cold CLI ops), and is no longer what production serves.
 * "Postgres reality": the container is the `postgres` service of compose project `gbrain` (still named
-  `gbrain-pg`, same volume, same port); recreate it with `gbrainctl compose --host studio -- up -d
+  `gbrain-pg`, same volume, same port); recreate it with `gbrainctl compose --host studio --allow-prod -- up -d
   --force-recreate postgres`, not a hand `docker run`.
 * "Nightly sync" / "Nightly pg_dump backup": the jobs run in the `gbrain-cron-1` container
   (`docker exec -u 502:20 gbrain-cron-1 gbrainjob show|run <job>`); logs in `/state` of that container; the
