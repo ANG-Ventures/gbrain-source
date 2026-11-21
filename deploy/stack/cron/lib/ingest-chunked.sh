@@ -308,11 +308,16 @@ main() {
         missing=$((expected - present))
         log "READBACK: $present/$expected importable files present in pages (missing $missing)"
         if [ $((missing * 1000)) -le $((expected * MISSING_PERMILLE)) ]; then
-          log "COMPLETE after pass $pass (DB readback $present/$expected)"
-          log "TOTAL WALL: $(( $(date +%s) - total_t0 ))s"
-          return 0
-        fi
-        if [ "$rc" = "0" ] && [ "$stalled" = "0" ]; then
+          # Rows present prove the paths were imported once, not that this pass wrote the current contents:
+          # a failed or killed pass never completes the root (Prism d41bb2babef3); the next pass re-imports
+          # and must exit 0 before the root counts as done.
+          if [ "$rc" = "0" ] && [ "$stalled" = "0" ]; then
+            log "COMPLETE after pass $pass (DB readback $present/$expected)"
+            log "TOTAL WALL: $(( $(date +%s) - total_t0 ))s"
+            return 0
+          fi
+          log "READBACK covers the root but pass $pass ended rc=$rc stalled=$stalled; not complete, running another pass"
+        elif [ "$rc" = "0" ] && [ "$stalled" = "0" ]; then
           log "INCOMPLETE: import exited 0 but DB holds $present of $expected files"
           echo "ingest-chunked: import of $TARGET exited 0 but the DB holds only $present of $expected importable files (missing $missing, over the ${MISSING_PERMILLE} permille limit)" >&2
           exit 1

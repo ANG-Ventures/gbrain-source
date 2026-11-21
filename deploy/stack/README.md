@@ -101,19 +101,33 @@ shared_buffers were colder).
 
 ## Before the cutover (operator, no downtime)
 
-1. Merge this PR. Pin PR: `hosts/studio.toml` `revision` = the merge sha, image tags `<sha12>-arm64`.
+1. Merge this PR (merge commit M). Then the pin PR: `hosts/studio.toml` `revision` = M, image tags
+   `<M12>-arm64`; merge it (merge commit P). M is what the images are built from; P is what the deploy checkout
+   is on, because only P carries the filled-in host profile (at M it still holds the `<placeholder>` pin and
+   build/render refuse). `gbrainctl build` reads `revision` from the profile and builds M itself.
 2. Create the 1P secure note `gbrain stack secrets v1` (Engineering vault) with four `KEY=base64` lines:
    * `TUNNEL_SSH_KEY_B64` a NEW ed25519 key for the rerank tunnel; authorize its public half on ACE-AI in
      `~ace/.ssh/authorized_keys` as `restrict,port-forwarding,permitopen="127.0.0.1:8084" ssh-ed25519 AAAA... gbrain-stack-tunnel`
-   * `TUNNEL_KNOWN_HOSTS_B64` `ssh-keyscan -t ed25519 192.168.1.216 | base64`
+   * `TUNNEL_KNOWN_HOSTS_B64` `ssh-keyscan -t ed25519 192.168.1.216 > /tmp/kh-ai`, then check it (below), then
+     `base64 < /tmp/kh-ai`
    * `NAS_SSH_KEY_B64` the key restic uses for `truenas_admin@192.168.1.159` (today the Studio's `~/.ssh/id_ed25519`;
      a dedicated key authorized for that user is the better choice)
-   * `NAS_KNOWN_HOSTS_B64` `ssh-keyscan -t ed25519 192.168.1.159 | base64`
-3. On the Studio: a deploy checkout at the pin, then build + render (render fails naming the key if step 2 is
-   incomplete):
+   * `NAS_KNOWN_HOSTS_B64` `ssh-keyscan -t ed25519 192.168.1.159 > /tmp/kh-nas`, then check it (below), then
+     `base64 < /tmp/kh-nas`
+
+   Check each scanned key before it goes into the note: a scan is unauthenticated, so compare its fingerprint with
+   the one the host itself reports over the Studio's existing, already-trusted ssh (the connection the launchd
+   tunnel and restic use today). The two lines of each pair must be identical; if not, stop:
+   ```
+   ssh-keygen -lf /tmp/kh-ai;  ssh ace@192.168.1.216 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   ssh-keygen -lf /tmp/kh-nas; ssh truenas_admin@192.168.1.159 ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+   rm /tmp/kh-ai /tmp/kh-nas   # after the note is saved
+   ```
+3. On the Studio: a deploy checkout at P (the pin PR's merge commit, NOT M), then build + render (render fails
+   naming the key if step 2 is incomplete):
    ```
    git clone --reference ~/.hermes/mirrors/ANG-Ventures/gbrain-source.git https://github.com/ANG-Ventures/gbrain-source.git ~/gbrain-stack-live
-   git -C ~/gbrain-stack-live checkout --detach <pin sha>
+   git -C ~/gbrain-stack-live checkout --detach <P: the pin PR's merge sha>
    cd ~/gbrain-stack-live/deploy/stack && python3.14 ./gbrainctl build --host studio && python3.14 ./gbrainctl render --host studio
    ```
 
@@ -128,7 +142,8 @@ that window, `rail.sh` falls back to the cold CLI (which needs postgres, so it f
 cd ~/gbrain-stack-live/deploy/stack
 U=$(id -u)
 # 1. stop the scheduled jobs that the cron container replaces (pause, never delete)
-hermes cron pause 9b1a4fdaaa2a   # gbrain-nightly-sync (its workflow-observer export moves to its own row, see hermes-home edits)
+hermes cron pause 9b1a4fdaaa2a   # gbrain-nightly-sync, export + import, left UNCHANGED for the rollback
+hermes cron resume <export-row>  # gbrain-observer-export, 03:25, export only (new row, shipped paused; see hermes-home edits)
 hermes cron pause a3bcde3fa92e   # gbrain-pg-backup
 hermes cron pause 7d0b9686f64e   # gbrain-deploy-parity
 # 2. downtime starts: stop + disable the launchd jobs (plists stay in ~/Library/LaunchAgents)
@@ -160,6 +175,7 @@ cd ~/gbrain-stack-live/deploy/stack; U=$(id -u)
 python3.14 ./gbrainctl down --host studio --allow-prod        # never `-v`: pgdata is external and stays
 docker rename gbrain-pg-launchd-era gbrain-pg && docker start gbrain-pg
 for l in ai.gbrain.rerank-tunnel ai.gbrain.rerank-proxy ai.gbrain.serve; do launchctl enable gui/$U/$l; launchctl bootstrap gui/$U ~/Library/LaunchAgents/$l.plist; done
+hermes cron pause <export-row>   # the export-only row; 9b1a4fdaaa2a below exports AND imports, as before
 hermes cron resume 9b1a4fdaaa2a; hermes cron resume a3bcde3fa92e; hermes cron resume 7d0b9686f64e
 ```
 The data volume is the same in both directions; nothing is migrated, so rollback loses nothing written meanwhile.
@@ -170,10 +186,13 @@ ANG-Ventures/gbrain `deploy/gbrain-pg/docker-compose.yml` (same image digest, vo
 
 hermes-home (one PR, merged before the window; every row edit is a pause or a new row, nothing deleted):
 
-* `cron/jobs.json` 9b1a4fdaaa2a gbrain-nightly-sync: keep the row but point it at an export-only step (the
+* `cron/jobs.json` 9b1a4fdaaa2a gbrain-nightly-sync: NOT edited. It keeps its export + import command, so the
+  rollback only resumes it.
+* `cron/jobs.json` new row gbrain-observer-export (the `<export-row>` above): 03:25, export only (the
   workflow-observer `gbrain-sync.py` export, which writes INTO the brain repo from hermes data and stays on the
-  host), at 03:25; the import half is the cron container's 03:30 `nightly-sync`. Until that PR lands the cutover
-  pauses the row and the export does not run.
+  host); the import half is the cron container's 03:30 `nightly-sync`. Ships `enabled: false`, `state: paused`,
+  `paused_reason: "t_ab2fcba3 cutover resumes it when 9b1a4fdaaa2a is paused"`, so the two never export the same
+  night. Cutover: pause 9b1a4fdaaa2a, resume this row. Rollback: pause this row, resume 9b1a4fdaaa2a.
 * `cron/jobs.json` a3bcde3fa92e gbrain-pg-backup and 7d0b9686f64e gbrain-deploy-parity: `enabled: false`,
   `paused_reason: "replaced by the gbrain stack cron container (t_ab2fcba3)"`.
 * `cron/jobs.json` new row gbrain-stack-watch: hourly, `no_agent`, `deliver` #alerts, script

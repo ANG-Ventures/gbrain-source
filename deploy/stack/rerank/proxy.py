@@ -121,13 +121,25 @@ def _alert_once(kind: str, severity: str, body: str) -> None:
     except Exception as e:
         print(f"[rerank-proxy] alert send failed ({kind}): {e}", flush=True)
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a 3xx: the allowlist is checked on the first URL only, and a followed redirect would carry
+    the DeepInfra Authorization header to whatever origin the Location names (Prism 7945fb55fb98). A 3xx
+    surfaces as HTTPError, which the caller treats like any other backend failure."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, f"redirect to {newurl!r} refused", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _post(url: str, body: dict, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(
         _checked_url(url), data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", **headers},
     )
-    # url passed _checked_url above: http(s) and the configured primary or the DeepInfra fallback only
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+    # url passed _checked_url above: http(s) and the configured primary or the DeepInfra fallback only;
+    # _OPENER refuses redirects, so no request leaves for another origin
+    with _OPENER.open(req, timeout=timeout) as r:  # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
         return json.load(r)
 
 def _caller(port: int) -> str:

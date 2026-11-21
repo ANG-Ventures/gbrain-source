@@ -283,9 +283,25 @@ def clean_env() -> dict:
     return env
 
 
+def project_override(args: list[str]) -> str | None:
+    """The first arg that names a compose project (-p X, -pX, -dp X, --project-name[=X]), or None.
+    Compose accepts the global -p after the subcommand too, so a forwarded one would replace the host file's
+    project and walk past the production guard (Prism 79c5595441c1). Scans every arg: a false refusal is safe."""
+    for x in args:
+        if x == "--project-name" or x.startswith("--project-name="):
+            return x
+        if x.startswith("-") and not x.startswith("--") and "p" in x[1:].split("=", 1)[0]:
+            return x
+    return None
+
+
 def run_compose(h: dict, stack: Path, args: list[str], capture=False):
     if args and args[0].startswith("-"):
         die(f"compose args must start with a compose subcommand, not global flag {args[0]!r}", 64)
+    bad = project_override(args)
+    if bad:
+        die(f"refusing compose project override {bad!r}: the project comes from the host file only "
+            f"({h['compose_project']!r})", 64)
     env_file = stack / ".env"
     try:
         first = env_file.read_text().split("\n", 1)[0]

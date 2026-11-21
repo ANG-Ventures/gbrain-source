@@ -90,15 +90,23 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 /usr/local/bin/gbrain extract-links >>"$LOG" 2>&1 || echo "gbrain-nightly-sync: extract-links failed (non-fatal)" >>"$LOG"
-touch "$STAMP"
 # The brain repo's index is shared with host-side git (exporters, the GitHub mirror). Through the bind mount the
 # container sees other inode/dev/uid/ctime values than the host, so default stat checks would rehash every file
 # (18 GB) on each side after the other wrote the index. Compare mtime + size only (measured in the proof: the first
 # `git add -A` over the mount re-read the whole tree). The cutover sets the same two keys in the repo config.
+# A git failure fails the run and leaves the stamp where it was, so the next night retries the snapshot
+# (Prism 5c4347a17373: a swallowed add/commit error used to advance the stamp with no snapshot).
 G=(git -C "$BRAIN" -c core.checkStat=minimal -c core.trustctime=false)
 committed=0
-if "${G[@]}" add -A 2>>"$LOG" && ! "${G[@]}" diff --cached --quiet 2>/dev/null; then
-  "${G[@]}" -c user.name="${GBRAIN_GIT_NAME:-gbrain-cron}" -c user.email="${GBRAIN_GIT_EMAIL:-gbrain-cron@localhost}" \
-    commit -q -m "nightly sync: $(date +%F) incremental ingest" 2>>"$LOG" && committed=1
-fi
+"${G[@]}" add -A 2>>"$LOG" || fail "git add in $BRAIN failed (see $LOG)"
+drc=0
+"${G[@]}" diff --cached --quiet 2>>"$LOG" || drc=$?
+case "$drc" in
+  0) ;;
+  1) "${G[@]}" -c user.name="${GBRAIN_GIT_NAME:-gbrain-cron}" -c user.email="${GBRAIN_GIT_EMAIL:-gbrain-cron@localhost}" \
+       commit -q -m "nightly sync: $(date +%F) incremental ingest" 2>>"$LOG" || fail "git commit in $BRAIN failed (see $LOG)"
+     committed=1 ;;
+  *) fail "git diff --cached in $BRAIN rc=$drc (see $LOG)" ;;
+esac
+touch "$STAMP"
 echo "EFFECT {\"roots_imported\": $n_roots, \"brain_committed\": $committed}"

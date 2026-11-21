@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -307,3 +308,127 @@ def test_images_run_as_the_stack_uid(img):
     assert users and users[-1] == "${GBRAIN_UID}:${GBRAIN_GID}"
     assert lines.index(next(l for l in lines if l.startswith("USER ${GBRAIN_UID}"))) < max(
         i for i, l in enumerate(lines) if l.startswith(("ENTRYPOINT", "CMD")))
+
+
+# ---- Prism 79c5595441c1: a forwarded --project-name cannot retarget compose past the guard -------------------
+@pytest.mark.parametrize("args", [["up", "--project-name=gbrain", "--dry-run"], ["up", "--project-name", "gbrain"],
+                                  ["down", "-p", "gbrain"], ["down", "-pgbrain"], ["up", "-dp", "gbrain"]])
+@pytest.mark.parametrize("allow", [False, True])
+def test_compose_refuses_forwarded_project_override(prod_stack, capsys, args, allow):
+    _, stack, log = prod_stack
+    with pytest.raises(SystemExit) as e:
+        gbrainctl.main(["compose", "--host-file", str(STACK / "hosts" / "studio-proof.toml"), "--stack-dir", str(stack)]
+                       + (["--allow-prod"] if allow else []) + ["--"] + args)
+    assert e.value.code == 64
+    assert "refusing compose project override" in capsys.readouterr().err
+    assert not log.exists()                                    # docker never ran
+
+
+def test_updown_refuses_forwarded_project_override(prod_stack, capsys):
+    _, stack, log = prod_stack
+    with pytest.raises(SystemExit) as e:
+        gbrainctl.main(["down", "--host-file", str(STACK / "hosts" / "studio-proof.toml"), "--stack-dir", str(stack),
+                        "--", "--project-name=gbrain"])
+    assert e.value.code == 64 and not log.exists()
+
+
+# ---- Prism 7945fb55fb98: the rerank proxy never follows a redirect (the bearer would go with it) --------------
+def test_rerank_proxy_refuses_redirects(monkeypatch):
+    import http.server
+    import threading
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            seen.append((self.path, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{self.server.server_port}/elsewhere")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    monkeypatch.setenv("RERANK_PRIMARY_BASE", base)
+    monkeypatch.setenv("DEEPINFRA_KEY_FILE", "/nonexistent")
+    proxy = load("rerank_proxy", STACK / "rerank" / "proxy.py")
+    try:
+        with pytest.raises(urllib.error.HTTPError) as e:
+            proxy._post(base + "/v1/rerank", {"q": 1}, {"Authorization": "Bearer t"}, 5)
+        assert e.value.code == 302
+        assert seen == [("/v1/rerank", "Bearer t")]              # the redirect target was never requested
+    finally:
+        srv.shutdown()
+
+
+# ---- Prism d41bb2babef3: rows already in the DB do not complete a root whose import pass failed ---------------
+def _ingest(tmp_path, rcs, max_passes):
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for f in ("ingest-chunked.sh", "import-exts.sh"):
+        shutil.copy(STACK / "cron" / "lib" / f, lib)
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "rcs").write_text("\n".join(rcs) + "\n")
+    fake = tmp_path / "fake-gbrain"
+    fake.write_text(f'#!/bin/bash\nn=$(cat {tmp_path}/calls 2>/dev/null | wc -l); echo x >> {tmp_path}/calls\n'
+                    f'exit "$(sed -n "$((n + 1))p" {tmp_path}/rcs)"\n')
+    fake.chmod(0o755)
+    h = lib / "harness.sh"
+    h.write_text('INGEST_CHUNKED_SOURCE_ONLY=1 . "$(dirname "$0")/ingest-chunked.sh"\n'
+                 'db_engine() { echo postgres; }\nreadback() { echo "1 1"; }\nmain "$1"\n')
+    env = {**os.environ, "GBRAIN_DIR": str(tmp_path), "GBRAIN_CMD": str(fake), "INGEST_LOG": str(tmp_path / "log"),
+           "WATCHDOG_POLL_S": "0.1", "PASS_GAP_S": "0", "MAX_PASSES": str(max_passes)}
+    r = subprocess.run(["bash", str(h), str(root)], env=env, capture_output=True, text=True, timeout=60)
+    return r.returncode, len((tmp_path / "calls").read_text().split()), (tmp_path / "log").read_text()
+
+
+def test_ingest_failed_pass_with_full_readback_runs_another_pass(tmp_path):
+    rc, calls, log = _ingest(tmp_path, ["1", "0"], 8)
+    assert (rc, calls) == (0, 2), log
+    assert "COMPLETE after pass 2" in log
+
+
+def test_ingest_never_completes_on_readback_alone(tmp_path):
+    rc, calls, log = _ingest(tmp_path, ["1", "1"], 2)
+    assert (rc, calls) == (1, 2), log
+    assert "COMPLETE" not in log
+
+
+# ---- Prism 5c4347a17373: a git failure fails the night and leaves the stamp where it was -----------------------
+def _night(tmp_path, lock_index):
+    gb, st, lib, bindir = tmp_path / "gb", tmp_path / "state", tmp_path / "lib", tmp_path / "bin"
+    for d in (gb / "brain" / "vault", st, lib, bindir):
+        d.mkdir(parents=True)
+    shutil.copy(STACK / "cron" / "lib" / "import-exts.sh", lib)
+    (lib / "audit_lock.py").write_text("import sys; sys.exit(0)\n")
+    (lib / "ingest-chunked.sh").write_text("exit 0\n")
+    brain = gb / "brain"
+    subprocess.run(["git", "init", "-q", str(brain)], check=True)
+    (brain / "vault" / "a.md").write_text("new")
+    if lock_index:
+        (brain / ".git" / "index.lock").write_text("")
+    stamp = st / "last-nightly-sync"
+    stamp.write_text("")
+    os.utime(stamp, (1_000_000, 1_000_000))
+    # /usr/local/bin/gbrain extract-links is absent off-image: the script treats it as non-fatal
+    env = {**os.environ, "GBRAIN_HOME": str(gb), "GBRAIN_STATE_DIR": str(st), "GBRAIN_CRON_LIB": str(lib),
+           "GBRAIN_NIGHTLY_ROOTS": "vault"}
+    r = subprocess.run(["bash", str(STACK / "cron" / "jobs" / "nightly-sync.sh")], env=env, capture_output=True,
+                       text=True)
+    return r, stamp.stat().st_mtime
+
+
+def test_nightly_git_failure_fails_and_keeps_stamp(tmp_path):
+    r, mtime = _night(tmp_path, lock_index=True)
+    assert r.returncode == 1 and "git add" in r.stdout, r.stdout + r.stderr
+    assert mtime == 1_000_000
+
+
+def test_nightly_commit_advances_stamp(tmp_path):
+    r, mtime = _night(tmp_path, lock_index=False)
+    assert r.returncode == 0 and '"brain_committed": 1' in r.stdout, r.stdout + r.stderr
+    assert mtime > 1_000_000
