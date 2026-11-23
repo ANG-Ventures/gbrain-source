@@ -258,9 +258,10 @@ def launchd_disabled(label: str) -> bool | None:
     return False
 
 
-def cron_rows(ids: tuple[str, ...]) -> dict[str, tuple[bool, str] | None]:
+def cron_jobs(ids: tuple[str, ...]) -> dict[str, dict | None]:
+    """The full cron rows for `ids` from `hermes cron list --all --json` (None = missing or unreadable)."""
     rc, out = sh("hermes", "cron", "list", "--all", "--json", timeout=60)
-    found: dict[str, tuple[bool, str] | None] = {i: None for i in ids}
+    found: dict[str, dict | None] = {i: None for i in ids}
     if rc != 0:
         return found
     try:
@@ -268,9 +269,38 @@ def cron_rows(ids: tuple[str, ...]) -> dict[str, tuple[bool, str] | None]:
     except ValueError:
         return found
     for j in (d.get("jobs", []) if isinstance(d, dict) else d):
-        if j.get("id") in found:
-            found[j["id"]] = (bool(j.get("enabled")), str(j.get("state")))
+        if isinstance(j, dict) and j.get("id") in found:
+            found[j["id"]] = j
     return found
+
+
+def cron_rows(ids: tuple[str, ...]) -> dict[str, tuple[bool, str] | None]:
+    return {i: None if j is None else (bool(j.get("enabled")), str(j.get("state"))) for i, j in cron_jobs(ids).items()}
+
+
+# The cron store's write guard (hermes-home scripts/cron-write-guard -> cron_write_guard.py, which runs
+# scripts/lint_one_sender_crons.py on the candidate row). `hermes cron resume` passes every enabled row through it.
+CRON_WRITE_GUARD = Path("~/.hermes/scripts/cron-write-guard")
+
+
+def cron_resume_accepted(ids: tuple[str, ...], guard: Path | None = None) -> tuple[bool, str]:
+    """Would `hermes cron resume` be accepted for each row? Asks the store's own write guard with the row as it
+    would be after the resume (enabled). Read-only: the guard grades the candidate in a temp dir and writes nothing."""
+    g = Path(os.path.expanduser(str(guard or CRON_WRITE_GUARD)))
+    if not os.access(g, os.X_OK):
+        return False, f"{g} missing: cannot ask the cron write guard"
+    parts, ok = [], True
+    for i, j in cron_jobs(ids).items():
+        if j is None:
+            parts.append(f"{i}=missing")
+            ok = False
+            continue
+        cand = dict(j, enabled=True, state="scheduled", paused_at=None, paused_reason=None)
+        cand.pop("latest_execution", None)
+        rc, out = sh(str(g), "update", timeout=60, input=json.dumps(cand))
+        parts.append(f"{i}=" + ("accepted" if rc == 0 else f"REFUSED rc={rc}: {out[-300:]}"))
+        ok &= rc == 0
+    return ok, " ".join(parts)
 
 
 def cron_state_ok(want: dict[str, bool]) -> tuple[bool, str]:

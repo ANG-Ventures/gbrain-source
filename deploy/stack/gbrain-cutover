@@ -193,6 +193,11 @@ def steps(h: dict, drill: bool) -> list[Step]:
              expect="HTTP answer through the new key", readonly=True, prod_only=not h.get("rerank_tunnel")),
         Step("P7", "NAS key: restic's sftp target answers with the rendered key", readback=nas_probe,
              expect="rc=0", readonly=True, prod_only=not h.get("nas_backup")),
+        # the rows C1 and C13 resume deliver to #alerts: the cron write guard refuses a resume unless the fleet cron
+        # lint accepts the row (fail-only registry); this asks it now, before C1 changes anything
+        Step("P8", "cron write guard accepts resuming the rows C1 and C13 resume (asks the guard, writes nothing)",
+             readback=lambda: W.cron_resume_accepted((W.CRON_OBSERVER_EXPORT, W.CRON_STACK_WATCH)),
+             expect="accepted x2", readonly=True, prod_only=True),
         Step("C1", "pause the jobs the cron container replaces; resume the export-only row",
              cmds=[["hermes", "cron", "pause", W.CRON_NIGHTLY_SYNC], ["hermes", "cron", "pause", W.CRON_PG_BACKUP],
                    ["hermes", "cron", "pause", W.CRON_DEPLOY_PARITY],

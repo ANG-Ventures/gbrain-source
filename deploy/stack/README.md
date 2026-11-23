@@ -138,7 +138,7 @@ shared_buffers were colder).
 
 Scripted (card t_bb0e9194): `python3.14 ./gbrain-cutover --host studio` prints every step below with its readback
 and changes nothing (the P* preflight probes run: images at the pin, render, the hand-run postgres, launchd, cron
-rows, the new tunnel key against ACE-AI, the NAS key); `--apply` runs it and stops at the first readback that is not
+rows, the new tunnel key against ACE-AI, the NAS key, and the cron write guard on the two rows C1/C13 resume); `--apply` runs it and stops at the first readback that is not
 ok. Undo from any point: `python3.14 ./gbrain-rollback --host studio [--apply]`; its launchd step (R4) is queued
 through `~/.hermes/scripts/detached-run.py` (launchctl bootstrap is refused inside an agent gateway) and waited on.
 A `--drill` profile that names a production pg container, volume or port is refused before any step runs.
