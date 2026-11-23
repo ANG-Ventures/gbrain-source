@@ -206,6 +206,9 @@ def steps(h: dict, drill: bool) -> list[Step]:
         Step("C2", "stop + disable the launchd services (plists stay in ~/Library/LaunchAgents)",
              cmds=[c for lab in W.LAUNCHD_LABELS for c in
                    (["launchctl", "bootout", f"gui/{uid}/{lab}"], ["launchctl", "disable", f"gui/{uid}/{lab}"])],
+             # bootout returns while the job is still exiting (`state = SIGTERMed`, 2nd window 11-23): wait for the
+             # state, up to 60 s, before the readback judges it
+             run=lambda: W.wait_for(launchd_off, 60, every=1),
              readback=launchd_off, expect="not-loaded/disabled x3", prod_only=True, downtime_start=not drill),
         Step("C3", "brain repo: compare mtime+size only (host git and the cron container share the index)",
              cmds=[["git", "-C", os.path.expanduser(h["brain_source"]), "config", "core.checkStat", "minimal"],

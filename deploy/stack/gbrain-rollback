@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +28,14 @@ from window_lib import Step  # noqa: E402
 DETACHED_RUN = Path(os.path.expanduser("~/.hermes/scripts/detached-run.py"))
 DETACHED_NAME = "gbrain-rollback-launchd"
 LAUNCHD_SCRIPT = W.HERE / "rollback-launchd.sh"
+# detached-run refuses (rc 2) any untracked script with a loop and a sleep as a hand-written poller unless this is
+# given (2nd window 11-23: R4 refused, gbrain down 2 min 47 s). rollback-launchd.sh's loop is a bounded readback.
+ALLOW_POLLER = "R4 launchd readback: 10 x 2 s bounded wait for three labels, not a PR or CI watcher"
+
+
+def r4_argv(detached_run: Path = DETACHED_RUN) -> list[str]:
+    """The exact enqueue argv R4 runs (the test runs it against the real detached-run.py)."""
+    return [sys.executable, str(detached_run), "--allow-poller", ALLOW_POLLER, DETACHED_NAME, str(LAUNCHD_SCRIPT)]
 
 
 def steps(h: dict, drill: bool) -> list[Step]:
@@ -95,8 +104,7 @@ def steps(h: dict, drill: bool) -> list[Step]:
              if j is not None else "no answer")
 
     def launchd_enqueue():
-        r = subprocess.run([sys.executable, str(DETACHED_RUN), DETACHED_NAME, str(LAUNCHD_SCRIPT)],
-                           capture_output=True, text=True)
+        r = subprocess.run(r4_argv(), capture_output=True, text=True)
         out = (r.stdout + r.stderr).strip()
         if r.returncode != 0:
             raise W.Stop(f"R4 detached-run enqueue rc={r.returncode}: {out[-300:]}")
@@ -128,7 +136,7 @@ def steps(h: dict, drill: bool) -> list[Step]:
              expect=f"{pg} running=true restart=unless-stopped compose=- pg_isready=ok port open",
              downtime_end=drill),
         Step("R4", "launchd jobs re-registered by a DETACHED job (enable + bootstrap x3), then wait for them",
-             show=[f"{sys.executable} {DETACHED_RUN} {DETACHED_NAME} {LAUNCHD_SCRIPT}",
+             show=[shlex.join(r4_argv()),
                    f"(job: launchctl enable + bootstrap gui/{os.getuid()}/<label> for {', '.join(W.LAUNCHD_LABELS)})"],
              run=launchd_enqueue, readback=launchd_back,
              expect="state = running x3; serve engine=postgres; rerank /health answers (primary_ok advisory)",
