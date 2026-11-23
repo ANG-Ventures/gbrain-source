@@ -591,6 +591,16 @@ def test_watch_pages_each_failure_once(watch, capsys):
     assert rc == 1 and "rerank-tunnel NOT RUNNING" in out
 
 
+def test_watch_check_reports_every_finding_and_keeps_no_state(watch, capsys):
+    """--check (cutover C14, Prism 5fd839303bc5): the same finding twice is rc 1 twice, and no episode file."""
+    mod, st, rd = watch
+    st["down"].add("rerank-tunnel")
+    for _ in range(2):
+        assert mod.main(["--host", "t", "--no-github", "--check"]) == 1
+        assert "rerank-tunnel NOT RUNNING" in capsys.readouterr().out
+    assert not (rd / mod.STATE_FILE).exists()
+
+
 def test_watch_state_write_does_not_follow_a_planted_symlink(watch, tmp_path):
     """Prism 110df17353ff: the receipts dir is container-writable, so a symlink planted at a predictable temp path
     must not be written through."""

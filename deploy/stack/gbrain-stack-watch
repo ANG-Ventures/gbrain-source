@@ -2,7 +2,7 @@
 # SCHEDULE: manual (called by the hermes-home cron row that replaces gbrain-deploy-parity; README "Cutover" step 7)
 """gbrain-stack-watch: the host-side monitor for the gbrain compose stack (card t_ab2fcba3). stdlib only.
 
-  gbrain-stack-watch --host studio [--stack-dir DIR] [--no-github]
+  gbrain-stack-watch --host studio [--stack-dir DIR] [--no-github] [--check]
 
 The checks that need the docker socket or the host's GitHub credentials, i.e. what the in-container jobs cannot see:
   1. every running service of the project carries org.opencontainers.image.revision == hosts/<h>.toml `revision`
@@ -24,6 +24,8 @@ Pages once per episode: each finding has a key (a failed cron result's key carri
 are kept in <receipts_dir>/stack-watch-state.json, and only keys not open on the previous run are printed. A finding
 that clears and comes back pages again. Silent + exit 0 when nothing is new; new findings on stdout + exit 1 (a
 no_agent cron row delivers stdout to #alerts).
+--check (gbrain-cutover C14): print EVERY current finding and exit 1 on any; the episode state is neither read nor
+written, so a one-off check can never pass on a finding it recorded itself or hide one from the hourly row.
 """
 from __future__ import annotations
 
@@ -128,6 +130,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
     ap.add_argument("--no-github", action="store_true")
+    ap.add_argument("--check", action="store_true", help="every current finding, no episode state (cutover C14)")
     a = ap.parse_args(argv)
     h = tomllib.loads((HERE / "hosts" / f"{a.host}.toml").read_text())
     proj, pin = h["compose_project"], h["revision"]
@@ -207,7 +210,7 @@ def main(argv=None) -> int:
                     + " | ".join((r.get("tail") or [])[-3:])[:400])
             elif time.time() - p.stat().st_mtime > grace:
                 add(f"cron-stale:{job}", f"cron job {job}: last ok result is older than {grace // 3600} h")
-    out = page_new(found, rd / STATE_FILE)
+    out = [t for _, t in found] if a.check else page_new(found, rd / STATE_FILE)
     if not out:
         return 0
     print(f"⚠️ gbrain stack {proj} ({time.strftime('%Y-%m-%d %H:%M %Z')}):")

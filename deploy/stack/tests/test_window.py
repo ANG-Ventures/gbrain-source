@@ -107,7 +107,7 @@ def test_cutover_order_and_prod_only_set():
     assert by["C2"].downtime_start and by["C6"].downtime_end
     assert by["C6"].cmds[0][-3:] == ["--", "up", "-d"] and "up" not in by["C6"].cmds[0][2:3]   # no re-render
     assert by["C11"].always
-    assert not by["C14"].dry_readback          # stack-watch records its episode state: never in a dry run
+    assert by["C14"].always                    # one readback call (Prism 5fd839303bc5)
     drill = {s.sid: s for s in cutover.steps(_host(), drill=True)}
     assert drill["C5"].downtime_start and not drill["C2"].downtime_start
 
@@ -132,6 +132,41 @@ def test_scripts_refuse_wrong_mode_pairing(script, tmp_path):
     run = lambda *a: subprocess.run([sys.executable, str(STACK / script), *a], capture_output=True, text=True)  # noqa
     assert run("--host-file", str(hf)).returncode == 2                      # scratch project without --drill
     assert run("--host", "studio", "--drill").returncode == 2               # production with --drill
+
+
+@pytest.mark.parametrize("script", ["gbrain-cutover", "gbrain-rollback"])
+def test_drill_refuses_a_profile_naming_production_targets(script, tmp_path):
+    """Prism e8731ada0c50: a scratch project whose pg container / volume / ports are production's is refused before
+    any step runs (C4/C5 act on pg_container outside compose)."""
+    hf = tmp_path / "d.toml"
+    hf.write_text((STACK / "hosts" / "studio.toml").read_text().replace('compose_project = "gbrain"',
+                                                                         'compose_project = "gbrain-drill"'))
+    r = subprocess.run([sys.executable, str(STACK / script), "--host-file", str(hf), "--drill"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "pg_container=gbrain-pg" in r.stderr and "ports.serve=8199" in r.stderr, r.stderr
+    assert W.drill_clashes(W.load_host("studio-proof", None, "/tmp/nowhere")) == []
+
+
+def test_c14_runs_the_watch_once_in_check_mode(monkeypatch, capsys):
+    """Prism 5fd839303bc5: C14 calls the watch once, with --check; a finding stops the window."""
+    calls = []
+    monkeypatch.setattr(W, "sh", lambda *a, **k: (calls.append(a), (1, "parity finding"))[1])
+    c14 = next(s for s in cutover.steps(_host(), drill=False) if s.sid == "C14")
+    assert W.Window("t", apply=True, drill=False).run_steps([c14]) == 1
+    assert len(calls) == 1 and "--check" in calls[0]
+    assert "STOPPED: C14 readback not ok" in capsys.readouterr().out
+
+
+def test_rollback_r4_does_not_wait_on_the_rerank_primary(monkeypatch):
+    """Prism ab8e60469570: launchd back + serve ok + rerank answering is enough; primary_ok=false is advisory."""
+    monkeypatch.setattr(W, "launchd_state", lambda lab: "running")
+    monkeypatch.setattr(W, "serve_health", lambda h: (True, "serve ok"))
+    monkeypatch.setattr(W, "http_json", lambda url, timeout=3: {"primary_ok": False})
+    st = {s.sid: s for s in rollback.steps(_host(), drill=False)}
+    ok, text = st["R4"].readback()
+    assert ok and "ADVISORY" in text
+    monkeypatch.setattr(W, "http_json", lambda url, timeout=3: None)
+    assert st["R4"].readback()[0] is False
 
 
 # ---- gbrain-stack-watch parity: the pin PR's own commit is master, not the pin -----------------------------------

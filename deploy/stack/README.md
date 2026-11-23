@@ -141,6 +141,7 @@ and changes nothing (the P* preflight probes run: images at the pin, render, the
 rows, the new tunnel key against ACE-AI, the NAS key); `--apply` runs it and stops at the first readback that is not
 ok. Undo from any point: `python3.14 ./gbrain-rollback --host studio [--apply]`; its launchd step (R4) is queued
 through `~/.hermes/scripts/detached-run.py` (launchctl bootstrap is refused inside an agent gateway) and waited on.
+A `--drill` profile that names a production pg container, volume or port is refused before any step runs.
 Run both from a plain terminal in the deploy checkout; the scripts' C*/R* ids map onto the numbered steps here.
 Cron row ids (hermes-home PR): `<export-row>` = `2127ecdb32ee` gbrain-observer-export, `<gbrain-stack-watch row>` =
 `70c54de14efe`; both ship paused.
@@ -215,7 +216,7 @@ until docker exec gbrain-pg pg_isready -q; do sleep 1; done; nc -z 127.0.0.1 543
 for l in ai.gbrain.rerank-tunnel ai.gbrain.rerank-proxy ai.gbrain.serve; do launchctl enable gui/$U/$l; launchctl bootstrap gui/$U ~/Library/LaunchAgents/$l.plist; done
 for l in ai.gbrain.rerank-tunnel ai.gbrain.rerank-proxy ai.gbrain.serve; do launchctl print gui/$U/$l | grep -m1 'state ='; done   # state = running x3
 until curl -sf -m 3 http://127.0.0.1:8199/health | grep -q '"engine":"postgres"'; do sleep 1; done; echo serve-ok   # serve-ok
-curl -s http://127.0.0.1:18085/health                                      # primary_ok true
+curl -s http://127.0.0.1:18085/health   # answers; primary_ok false is the reranker host, not the rollback: go on to R5
 # R5. the launchd-era cron rows
 hermes cron pause <export-row>   # the export-only row; 9b1a4fdaaa2a below exports AND imports, as before
 hermes cron resume 9b1a4fdaaa2a; hermes cron resume a3bcde3fa92e; hermes cron resume 7d0b9686f64e

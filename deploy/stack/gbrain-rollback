@@ -83,12 +83,16 @@ def steps(h: dict, drill: bool) -> list[Step]:
         W.wait_for(pg_back, 120)
 
     def launchd_back():
+        # The rerank proxy answering is required; its PRIMARY is not (Prism ab8e60469570): launchd and the stack
+        # share the reranker host, so a primary outage cannot be fixed by the rollback and must not hold R5
+        # (backups + nightly sync) paused. Its state is printed for the operator.
         s = {lab: W.launchd_state(lab) for lab in W.LAUNCHD_LABELS}
         ok_s, txt_s = W.serve_health(h)
         j = W.http_json(f"http://127.0.0.1:{h['ports']['rerank']}/health", timeout=15)
-        ok = all(v == "running" for v in s.values()) and ok_s and bool(j) and j.get("primary_ok") is True
+        ok = all(v == "running" for v in s.values()) and ok_s and j is not None
         return ok, " ".join(f"{k}={v}" for k, v in s.items()) + f"; {txt_s}; rerank primary_ok=" + \
-            str(j.get("primary_ok") if j else "no answer")
+            (str(j.get("primary_ok")) + ("" if j.get("primary_ok") is True else " (ADVISORY: reranker host)")
+             if j is not None else "no answer")
 
     def launchd_enqueue():
         r = subprocess.run([sys.executable, str(DETACHED_RUN), DETACHED_NAME, str(LAUNCHD_SCRIPT)],
@@ -127,7 +131,7 @@ def steps(h: dict, drill: bool) -> list[Step]:
              show=[f"{sys.executable} {DETACHED_RUN} {DETACHED_NAME} {LAUNCHD_SCRIPT}",
                    f"(job: launchctl enable + bootstrap gui/{os.getuid()}/<label> for {', '.join(W.LAUNCHD_LABELS)})"],
              run=launchd_enqueue, readback=launchd_back,
-             expect="state = running x3; serve engine=postgres; rerank primary_ok=True",
+             expect="state = running x3; serve engine=postgres; rerank /health answers (primary_ok advisory)",
              prod_only=True, downtime_end=not drill),
         Step("R5", "the launchd-era cron rows back; the export-only row paused",
              cmds=[["hermes", "cron", "pause", W.CRON_OBSERVER_EXPORT],
@@ -152,6 +156,8 @@ def main(argv=None) -> int:
         ap.error("--drill is for a scratch host profile, not the production project")
     if h["compose_project"] != "gbrain" and not a.drill:
         ap.error(f"project {h['compose_project']!r} is not production: add --drill")
+    if a.drill and (clash := W.drill_clashes(h)):
+        ap.error("drill profile names production targets: " + "; ".join(clash))
     return W.Window("gbrain-rollback", a.apply, a.drill).run_steps(steps(h, a.drill))
 
 

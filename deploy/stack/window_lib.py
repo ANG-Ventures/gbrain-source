@@ -167,6 +167,25 @@ def load_host(host: str | None, host_file: str | None, stack_dir: str | None) ->
     return h
 
 
+def drill_clashes(h: dict) -> list[str]:
+    """A --drill profile's docker targets that a production profile (hosts/*.toml with compose_project "gbrain")
+    also names: pg container, data volume, published ports. C4/C5 act on pg_container outside compose, so the
+    project-name guard alone let a scratch profile stop the live database (Prism e8731ada0c50)."""
+    out = []
+    for p in sorted((HERE / "hosts").glob("*.toml")):
+        prod = tomllib.loads(p.read_text())
+        if prod.get("compose_project") != "gbrain":
+            continue
+        for k in ("pg_container", "pg_volume"):
+            if h.get(k) and h.get(k) == prod.get(k):
+                out.append(f"{k}={h[k]} is {p.name}'s")
+        prod_ports = set((prod.get("ports") or {}).values())
+        for k, v in sorted((h.get("ports") or {}).items()):
+            if v in prod_ports:
+                out.append(f"ports.{k}={v} is a {p.name} port")
+    return out
+
+
 def gbrainctl(h: dict, *args: str) -> list[str]:
     """argv for this checkout's gbrainctl; the host args go before a `--` (what follows it goes to compose)."""
     a = list(args)

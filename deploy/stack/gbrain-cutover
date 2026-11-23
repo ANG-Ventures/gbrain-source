@@ -168,8 +168,11 @@ def steps(h: dict, drill: bool) -> list[Step]:
         return rc == 0 and (receipts / "ARMED-AT").exists(), f"/state/ARMED rc={rc}; ARMED-AT {(receipts / 'ARMED-AT').exists()}"
 
     def watch_ok():
-        rc, out = W.sh(sys.executable, str(W.HERE / "gbrain-stack-watch"), "--host", h["name"], timeout=120)
-        return rc == 0, f"gbrain-stack-watch rc={rc} {out[-300:]}"
+        # --check: every current finding, no episode state (Prism 5fd839303bc5: the hourly mode reports a finding
+        # once, so a second call passed on it and the hourly row then never paged it)
+        rc, out = W.sh(sys.executable, str(W.HERE / "gbrain-stack-watch"), "--host", h["name"], "--check",
+                       timeout=120)
+        return rc == 0, f"gbrain-stack-watch --check rc={rc} {out[-300:]}"
 
     host_stamp = home / ".gbrain" / "last-nightly-sync"
     return [
@@ -229,8 +232,8 @@ def steps(h: dict, drill: bool) -> list[Step]:
                    ["touch", str(receipts / "ARMED-AT")]], readback=armed_ok, expect="both present", prod_only=True),
         Step("C13", "resume the gbrain-stack-watch row", cmds=[["hermes", "cron", "resume", W.CRON_STACK_WATCH]],
              readback=lambda: W.cron_state_ok({W.CRON_STACK_WATCH: True}), expect="enabled", prod_only=True),
-        Step("C14", "gbrain-stack-watch once", readback=watch_ok, expect="rc=0", prod_only=True,
-             dry_readback=False),   # it writes <receipts_dir>/stack-watch-state.json (the page-once episodes)
+        Step("C14", "gbrain-stack-watch --check once: no finding at all", readback=watch_ok, expect="rc=0",
+             prod_only=True, always=True),   # always: one call, after C13 (no before-check)
     ]
 
 
@@ -249,6 +252,8 @@ def main(argv=None) -> int:
         ap.error("--drill is for a scratch host profile, not the production project")
     if h["compose_project"] != "gbrain" and not a.drill:
         ap.error(f"project {h['compose_project']!r} is not production: add --drill")
+    if a.drill and (clash := W.drill_clashes(h)):
+        ap.error("drill profile names production targets: " + "; ".join(clash))
     w = W.Window("gbrain-cutover", a.apply, a.drill)
     rc = w.run_steps(steps(h, a.drill))
     if rc == 0 and a.apply and not a.drill:
