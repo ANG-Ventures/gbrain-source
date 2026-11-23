@@ -197,6 +197,54 @@ def test_rollback_launchd_step_is_detached():
     assert r.returncode == 0
 
 
+def test_c2_waits_through_sigtermed_before_judging(monkeypatch, capsys):
+    # 2nd window 11-23: C2 read `ai.gbrain.serve=SIGTERMed` once, right after the bootout, and stopped the window
+    reads = {lab: iter(["SIGTERMed", "SIGTERMed", "not-loaded"]) for lab in W.LAUNCHD_LABELS}
+    last = {}
+
+    def state(lab):
+        last[lab] = next(reads[lab], last.get(lab, "not-loaded"))
+        return last[lab]
+    monkeypatch.setattr(W, "launchd_state", state)
+    monkeypatch.setattr(W, "launchd_disabled", lambda lab: True)
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    c2 = {s.sid: s for s in cutover.steps(_host(), drill=False)}["C2"]
+    c2.cmds = []                                 # no launchctl here; the wait and the readback are what is tested
+    assert W.Window("t", apply=True, drill=False).run_steps([c2]) == 0, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "readback: ai.gbrain.serve=not-loaded/disabled" in out and "STOPPED" not in out
+    # a service that never leaves SIGTERMed still stops C2 once the 60 s wait is over
+    monkeypatch.setattr(W, "launchd_state", lambda lab: "SIGTERMed")
+    clock = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(W.time, "monotonic", lambda: next(clock))
+    assert W.Window("t", apply=True, drill=False).run_steps([c2]) == 1
+    assert "STOPPED: C2 readback not ok: ai.gbrain.serve=SIGTERMed/disabled" in capsys.readouterr().out
+
+
+# The REAL detached-run.py: ~/.hermes/scripts/detached-run.py on the Studio; GBRAIN_TEST_DETACHED_RUN points at a
+# hermes-home checkout's copy elsewhere. It has no dry/no-queue enqueue mode (--dry-run is only for
+# --resume-after-boot), so the test runs the full enqueue with DETACHED_RUN_HOME at a temp dir: every gate runs and the
+# job lands in a temp queue that no launchd runner watches. DETACHED_RUN_KANBAN_CMD=false keeps the card binding off.
+REAL_DETACHED_RUN = Path(os.environ.get("GBRAIN_TEST_DETACHED_RUN") or rollback.DETACHED_RUN)
+
+
+@pytest.mark.skipif(not REAL_DETACHED_RUN.is_file(), reason=f"no detached-run.py at {REAL_DETACHED_RUN}")
+def test_r4_enqueue_argv_is_accepted_by_the_real_detached_run(tmp_path):
+    env = dict(os.environ, DETACHED_RUN_HOME=str(tmp_path), DETACHED_RUN_KANBAN_CMD="false")
+    env.pop("DETACHED_RUN_ROOT", None)
+    env.pop("DETACHED_RUN_POLLER_GATE", None)
+    argv = rollback.r4_argv(REAL_DETACHED_RUN)
+    # control: the argv R4 used in the 2nd window (no --allow-poller) is refused rc 2 as a poller
+    old = [a for i, a in enumerate(argv) if a != "--allow-poller" and argv[i - 1] != "--allow-poller"]
+    r = subprocess.run(old, capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 2 and "hand-written poller" in r.stderr, r.stdout + r.stderr
+    r = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    job = json.loads((tmp_path / "var" / "detached" / "queue" / f"{rollback.DETACHED_NAME}.json").read_text())
+    assert job["allow_poller"] == rollback.ALLOW_POLLER
+    assert job["placement"]["mode"] == "studio"   # launchctl gui/<uid> must run on this host, never a pool host
+
+
 @pytest.mark.parametrize("script", ["gbrain-cutover", "gbrain-rollback"])
 def test_scripts_refuse_wrong_mode_pairing(script, tmp_path):
     hf = tmp_path / "d.toml"
