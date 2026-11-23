@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -100,7 +102,8 @@ def test_cutover_order_and_prod_only_set():
     st = cutover.steps(_host(), drill=False)
     ids = [s.sid for s in st]
     assert ids.index("C4") < ids.index("C5") < ids.index("C6")
-    assert {s.sid for s in st if s.prod_only} == {"P4", "P5", "C1", "C2", "C3", "C9", "C10", "C12", "C13", "C14"}
+    assert ids.index("P8") < ids.index("C1")
+    assert {s.sid for s in st if s.prod_only} == {"P4", "P5", "P8", "C1", "C2", "C3", "C9", "C10", "C12", "C13", "C14"}
     by = {s.sid: s for s in st}
     assert by["C4"].cmds == [["docker", "update", "--restart=no", "gbrain-pg"]]
     assert by["C5"].cmds[0] == ["docker", "stop", "-t", "60", "gbrain-pg"]
@@ -139,6 +142,47 @@ def test_ssh_probes_ignore_host_ssh_config(monkeypatch):
     for argv in seen:
         assert argv[1:3] == ["-F", "/dev/null"]
         assert "IdentityAgent=none" in argv and "IdentitiesOnly=yes" in argv and "StrictHostKeyChecking=yes" in argv
+
+
+def test_p8_asks_the_cron_write_guard_about_the_resumed_rows(tmp_path, monkeypatch):
+    """The 11-23 window stopped at C1: the guard refused `cron resume` of a #alerts row whose script was not in the
+    fail-only registry. P8 sends each row C1/C13 resume, enabled, to the guard before anything changes."""
+    rows = [{"id": W.CRON_OBSERVER_EXPORT, "script": "gbrain-observer-export.sh", "enabled": False, "state": "paused",
+             "deliver": "discord:1", "latest_execution": {"x": 1}},
+            {"id": W.CRON_STACK_WATCH, "script": "gbrain-stack-watch.sh", "enabled": False, "state": "paused",
+             "deliver": "discord:1"}]
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "hermes").write_text("#!/bin/sh\ncat " + str(tmp_path / "rows.json") + "\n")
+    (tmp_path / "rows.json").write_text(json.dumps({"jobs": rows}))
+    reg, seen = tmp_path / "registry.txt", tmp_path / "seen.jsonl"
+    guard = tmp_path / "cron-write-guard"     # refuses unless the row is enabled and its script is registered
+    guard.write_text(f"""#!{sys.executable}
+import json, sys
+row = json.loads(sys.stdin.read())
+open({str(seen)!r}, "a").write(json.dumps([sys.argv[1], row]) + "\\n")
+if row["enabled"] is not True or row["script"] not in open({str(reg)!r}).read().split():
+    sys.exit(print("script %r is not in the fail-only registry" % row["script"], file=sys.stderr) or 1)
+""")
+    for f in (bin_ / "hermes", guard):
+        f.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    monkeypatch.setattr(W, "CRON_WRITE_GUARD", guard)
+    p8 = next(s for s in cutover.steps(_host(), drill=False) if s.sid == "P8")
+
+    reg.write_text("gbrain-stack-watch.sh\n")
+    ok, text = p8.readback()
+    assert not ok and f"{W.CRON_OBSERVER_EXPORT}=REFUSED rc=1" in text and f"{W.CRON_STACK_WATCH}=accepted" in text
+    reg.write_text("gbrain-observer-export.sh gbrain-stack-watch.sh\n")
+    assert p8.readback() == (True, f"{W.CRON_OBSERVER_EXPORT}=accepted {W.CRON_STACK_WATCH}=accepted")
+    graded = [json.loads(x) for x in seen.read_text().splitlines()]
+    assert all(op == "update" and r["enabled"] is True and "latest_execution" not in r for op, r in graded)
+    assert json.loads((tmp_path / "rows.json").read_text())["jobs"] == rows   # nothing written to the rows
+
+    (tmp_path / "rows.json").write_text(json.dumps({"jobs": rows[1:]}))
+    assert p8.readback() == (False, f"{W.CRON_OBSERVER_EXPORT}=missing {W.CRON_STACK_WATCH}=accepted")
+    monkeypatch.setattr(W, "CRON_WRITE_GUARD", tmp_path / "nope")
+    assert p8.readback()[0] is False
 
 
 def test_rollback_launchd_step_is_detached():
