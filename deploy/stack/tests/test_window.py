@@ -161,11 +161,11 @@ def test_rollback_r4_does_not_wait_on_the_rerank_primary(monkeypatch):
     """Prism ab8e60469570: launchd back + serve ok + rerank answering is enough; primary_ok=false is advisory."""
     monkeypatch.setattr(W, "launchd_state", lambda lab: "running")
     monkeypatch.setattr(W, "serve_health", lambda h: (True, "serve ok"))
-    monkeypatch.setattr(W, "http_json", lambda url, timeout=3: {"primary_ok": False})
+    monkeypatch.setattr(W, "http_json", lambda port, path="/health", timeout=3: {"primary_ok": False})
     st = {s.sid: s for s in rollback.steps(_host(), drill=False)}
     ok, text = st["R4"].readback()
     assert ok and "ADVISORY" in text
-    monkeypatch.setattr(W, "http_json", lambda url, timeout=3: None)
+    monkeypatch.setattr(W, "http_json", lambda port, path="/health", timeout=3: None)
     assert st["R4"].readback()[0] is False
 
 

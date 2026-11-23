@@ -141,7 +141,7 @@ def steps(h: dict, drill: bool) -> list[Step]:
 
     def rerank_ok():
         # /health probes the primary (4 s when it is down, measured in the drill)
-        j = W.http_json(f"http://127.0.0.1:{h['ports']['rerank']}/health", timeout=15)
+        j = W.http_json(h['ports']['rerank'], "/health", timeout=15)
         if drill and j is not None:
             return True, f"rerank /health answers (drill: no tunnel, primary_ok={j.get('primary_ok')} is advisory)"
         return bool(j) and j.get("primary_ok") is True, f"rerank :{h['ports']['rerank']}/health {j}"

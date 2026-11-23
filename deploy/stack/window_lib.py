@@ -204,17 +204,27 @@ def project_containers(project: str) -> list[str]:
     return out.split() if rc == 0 else []
 
 
-def http_json(url: str, timeout: float = 3) -> dict | None:
-    import urllib.request
+def http_json(port: int, path: str = "/health", timeout: float = 3) -> dict | None:
+    """GET http://127.0.0.1:<port><path> as JSON. Loopback only: the scheme and
+    host are fixed here, callers pass only a port and a path."""
+    import http.client
+    if not path.startswith("/"):
+        return None
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read().decode() or "{}")
+        conn.request("GET", path)
+        r = conn.getresponse()
+        if r.status >= 400:
+            return None
+        return json.loads(r.read().decode() or "{}")
     except Exception:
         return None
+    finally:
+        conn.close()
 
 
 def serve_health(h: dict) -> tuple[bool, str]:
-    j = http_json(f"http://127.0.0.1:{h['ports']['serve']}/health")
+    j = http_json(h['ports']['serve'], "/health")
     return (bool(j) and j.get("engine") == "postgres" and j.get("status") == "ok",
             f"serve :{h['ports']['serve']}/health {json.dumps(j) if j else 'no answer'}")
 

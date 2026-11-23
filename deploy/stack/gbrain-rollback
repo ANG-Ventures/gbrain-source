@@ -88,7 +88,7 @@ def steps(h: dict, drill: bool) -> list[Step]:
         # (backups + nightly sync) paused. Its state is printed for the operator.
         s = {lab: W.launchd_state(lab) for lab in W.LAUNCHD_LABELS}
         ok_s, txt_s = W.serve_health(h)
-        j = W.http_json(f"http://127.0.0.1:{h['ports']['rerank']}/health", timeout=15)
+        j = W.http_json(h['ports']['rerank'], "/health", timeout=15)
         ok = all(v == "running" for v in s.values()) and ok_s and j is not None
         return ok, " ".join(f"{k}={v}" for k, v in s.items()) + f"; {txt_s}; rerank primary_ok=" + \
             (str(j.get("primary_ok")) + ("" if j.get("primary_ok") is True else " (ADVISORY: reranker host)")
