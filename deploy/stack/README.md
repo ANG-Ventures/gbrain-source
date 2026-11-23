@@ -236,8 +236,10 @@ hermes-home (one PR, merged before the window; every row edit is a pause or a ne
   host); the import half is the cron container's 03:30 `nightly-sync`. Ships `enabled: false`, `state: paused`,
   `paused_reason: "t_ab2fcba3 cutover resumes it when 9b1a4fdaaa2a is paused"`, so the two never export the same
   night. Cutover: pause 9b1a4fdaaa2a, resume this row. Rollback: pause this row, resume 9b1a4fdaaa2a.
-* `cron/jobs.json` a3bcde3fa92e gbrain-pg-backup and 7d0b9686f64e gbrain-deploy-parity: `enabled: false`,
-  `paused_reason: "replaced by the gbrain stack cron container (t_ab2fcba3)"`.
+* `cron/jobs.json` a3bcde3fa92e gbrain-pg-backup and 7d0b9686f64e gbrain-deploy-parity: NOT edited (t_bb0e9194:
+  `enabled` merges into live, so an early merge would stop the backup before the window); `gbrain-cutover` C1
+  pauses them live and `gbrain-rollback` R5 resumes them. The PR (hermes-home#14273) merges at the start of the
+  window; the cutover's P5 preflight waits for its two paused rows to be live.
 * `cron/jobs.json` new row gbrain-stack-watch: hourly, `no_agent`, `deliver` #alerts, script
   `gbrain-stack-watch.sh` = `exec python3.14 ~/gbrain-stack-live/deploy/stack/gbrain-stack-watch --host studio`.
 * `scripts/gbrain-deploy-parity.sh`: header note "retired by the gbrain stack; see gbrain-stack-watch" (its
