@@ -112,6 +112,35 @@ def test_cutover_order_and_prod_only_set():
     assert drill["C5"].downtime_start and not drill["C2"].downtime_start
 
 
+def test_ssh_probes_ignore_host_ssh_config(monkeypatch):
+    # a host ~/.ssh/config ControlMaster would take P6's forward (ssh exits 0 at once) and prove the master's key
+    seen = []
+
+    class FakePopen:
+        returncode = 0
+
+        def __init__(self, argv, **kw):
+            seen.append(argv)
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        stderr = type("E", (), {"read": staticmethod(lambda: "")})()
+
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(cutover.W, "sh", lambda *argv, **kw: (seen.append(list(argv)), (0, ""))[1])
+    by = {s.sid: s for s in cutover.steps(_host(), drill=False)}
+    by["P6"].readback()
+    by["P7"].readback()
+    assert [a[0] for a in seen] == ["ssh", "sftp"]
+    for argv in seen:
+        assert argv[1:3] == ["-F", "/dev/null"]
+        assert "IdentityAgent=none" in argv and "IdentitiesOnly=yes" in argv and "StrictHostKeyChecking=yes" in argv
+
+
 def test_rollback_launchd_step_is_detached():
     st = {s.sid: s for s in rollback.steps(_host(), drill=False)}
     assert not st["R4"].cmds and st["R4"].run is not None and st["R4"].prod_only

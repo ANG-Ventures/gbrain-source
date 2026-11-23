@@ -93,7 +93,10 @@ def steps(h: dict, drill: bool) -> list[Step]:
         s.bind(("127.0.0.1", 0))
         lport = s.getsockname()[1]
         s.close()
-        p = subprocess.Popen(["ssh", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+        # -F /dev/null + IdentityAgent=none: no host ssh config (a ControlMaster would take the forward and
+        # prove the master's key) and no agent key, so only the rendered key and known-hosts file are used
+        p = subprocess.Popen(["ssh", "-F", "/dev/null", "-i", str(key), "-o", "IdentitiesOnly=yes",
+                              "-o", "IdentityAgent=none", "-o", "BatchMode=yes",
                               "-o", f"UserKnownHostsFile={kh}", "-o", "StrictHostKeyChecking=yes",
                               "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=8", "-N",
                               "-L", f"127.0.0.1:{lport}:127.0.0.1:8084", h["rerank_tunnel_target"]],
@@ -114,8 +117,8 @@ def steps(h: dict, drill: bool) -> list[Step]:
     def nas_probe():
         repo = h["restic"]["repo"]              # sftp:user@host:/path
         target, path = repo[len("sftp:"):].split(":", 1)
-        rc, out = W.sh("sftp", "-i", str(stack / "secrets" / "nas-ssh-key"), "-o", "IdentitiesOnly=yes",
-                       "-o", "BatchMode=yes", "-o", f"UserKnownHostsFile={stack / 'secrets' / 'nas-known-hosts'}",
+        rc, out = W.sh("sftp", "-F", "/dev/null", "-i", str(stack / "secrets" / "nas-ssh-key"),
+                       "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none", "-o", "BatchMode=yes", "-o", f"UserKnownHostsFile={stack / 'secrets' / 'nas-known-hosts'}",
                        "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-b", "-", target,
                        input=f"ls {path}\n", timeout=40)
         return rc == 0, f"sftp {target} ls {path}: rc={rc}" + ("" if rc == 0 else f" {out[-200:]}")
