@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""gbrain-cutover: move production gbrain from the launchd jobs + hand-run gbrain-pg to the compose stack
+(README "Cutover"; card t_bb0e9194). Dry run by default: prints every step with its readback and changes nothing.
+
+  python3.14 ./gbrain-cutover --host studio                 # dry run: preflight probes + every step, no change
+  python3.14 ./gbrain-cutover --host studio --apply         # the window (operator)
+  python3.14 ./gbrain-cutover --host-file F --stack-dir D --drill --apply   # the same window on a scratch copy
+
+Run it from the deploy checkout (hosts/<h>.toml `stack_dir`, at the pin PR's merge commit), in a plain terminal
+(not from inside an agent gateway: launchctl is refused there). Undo at any point: ./gbrain-rollback --host studio.
+P* steps are read-only preflight: under --apply the first one that is not ok stops the window before anything is
+changed. C* steps change state; each one's readback must be ok before the next starts.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import window_lib as W  # noqa: E402
+from window_lib import Step  # noqa: E402
+
+
+def steps(h: dict, drill: bool) -> list[Step]:
+    pin, proj, pg = h["revision"], h["compose_project"], h["pg_container"]
+    era = pg + W.LAUNCHD_ERA_SUFFIX
+    stack: Path = h["_stack"]
+    ug = f"{int(h['stack_uid'])}:{int(h['stack_gid'])}"
+    cron_c = f"{proj}-cron-1"
+    uid = os.getuid()
+    home = Path(os.path.expanduser(h.get("gbrain_home", "~/gbrain")))
+    receipts = Path(os.path.expanduser(h["receipts_dir"]))
+
+    def images():
+        bad = [] if "<" not in pin else ["revision is a <placeholder>"]
+        for k in ("server_image", "rerank_image", "cron_image"):
+            lab = W.docker_inspect(h[k], '{{index .Config.Labels "org.opencontainers.image.revision"}}')
+            if lab != pin:
+                bad.append(f"{h[k]} revision={lab or 'MISSING'}")
+        return not bad, ("pin " + pin[:12] + ": " + ("3 images built at the pin" if not bad else "; ".join(bad)))
+
+    def rendered():
+        try:
+            first = (stack / ".env").read_text().split("\n", 1)[0]
+        except FileNotFoundError:
+            return False, f"{stack}/.env missing: run gbrainctl render"
+        if not first.endswith(f"from hosts/{h['name']}.toml; do not edit"):
+            return False, f".env header is not for host {h['name']}: {first[:90]}"
+        need = ["openai-key", "pg-password", "deepinfra-key", "config.json"]
+        need += ["tunnel-ssh-key", "tunnel-known-hosts"] if h.get("rerank_tunnel") else []
+        need += ["nas-ssh-key", "nas-known-hosts", "restic-password"] if h.get("nas_backup") else []
+        empty = [n for n in need if not (stack / "secrets" / n).is_file() or (stack / "secrets" / n).stat().st_size == 0]
+        return not empty, (f"rendered for {h['name']}; {len(need)} secret files non-empty" if not empty
+                           else "empty/missing secrets: " + ",".join(empty) + " (1P note `gbrain stack secrets v1`?)")
+
+    def old_pg():
+        st = W.docker_inspect(pg, "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}} "
+                                  '{{index .Config.Labels "com.docker.compose.project"}}')
+        if W.docker_inspect(era, "{{.Name}}") is not None:
+            return False, f"{era} already exists: a cutover already ran (rollback first, or finish by hand)"
+        if st is None:
+            return False, f"no container {pg}"
+        parts = st.split()
+        ok = parts[:2] == ["true", "unless-stopped"] and len(parts) == 2
+        return ok, f"{pg} running={parts[0]} restart={parts[1]} compose_project={parts[2] if len(parts) > 2 else '-'}"
+
+    def launchd_running():
+        s = {lab: W.launchd_state(lab) for lab in W.LAUNCHD_LABELS}
+        return all(v == "running" for v in s.values()), " ".join(f"{k}={v}" for k, v in s.items())
+
+    def launchd_off():
+        s = {lab: (W.launchd_state(lab), W.launchd_disabled(lab)) for lab in W.LAUNCHD_LABELS}
+        return (all(v[0] == "not-loaded" and v[1] for v in s.values()),
+                " ".join(f"{k}={v[0]}/{'disabled' if v[1] else 'enabled'}" for k, v in s.items()))
+
+    def cron_before():
+        return W.cron_state_ok({W.CRON_NIGHTLY_SYNC: True, W.CRON_PG_BACKUP: True, W.CRON_DEPLOY_PARITY: True,
+                                W.CRON_OBSERVER_EXPORT: False, W.CRON_STACK_WATCH: False})
+
+    def cron_after_c1():
+        return W.cron_state_ok({W.CRON_NIGHTLY_SYNC: False, W.CRON_PG_BACKUP: False, W.CRON_DEPLOY_PARITY: False,
+                                W.CRON_OBSERVER_EXPORT: True})
+
+    def tunnel_probe():
+        # the NEW restricted key, from the rendered secrets, forwards to zerank-native on the reranker host
+        import socket
+        import subprocess
+        import time
+        key, kh = stack / "secrets" / "tunnel-ssh-key", stack / "secrets" / "tunnel-known-hosts"
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        lport = s.getsockname()[1]
+        s.close()
+        p = subprocess.Popen(["ssh", "-i", str(key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+                              "-o", f"UserKnownHostsFile={kh}", "-o", "StrictHostKeyChecking=yes",
+                              "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=8", "-N",
+                              "-L", f"127.0.0.1:{lport}:127.0.0.1:8084", h["rerank_tunnel_target"]],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            for _ in range(20):
+                time.sleep(0.5)
+                if p.poll() is not None:
+                    return False, f"ssh exited rc={p.returncode}: {(p.stderr.read() or '').strip()[-200:]}"
+                rc, out = W.sh("curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                               f"http://127.0.0.1:{lport}/health")
+                if rc == 0 and out not in ("", "000"):
+                    return True, f"tunnel key -> {h['rerank_tunnel_target']} :8084 answered HTTP {out}"
+            return False, "tunnel up but :8084 never answered"
+        finally:
+            p.terminate()
+
+    def nas_probe():
+        repo = h["restic"]["repo"]              # sftp:user@host:/path
+        target, path = repo[len("sftp:"):].split(":", 1)
+        rc, out = W.sh("sftp", "-i", str(stack / "secrets" / "nas-ssh-key"), "-o", "IdentitiesOnly=yes",
+                       "-o", "BatchMode=yes", "-o", f"UserKnownHostsFile={stack / 'secrets' / 'nas-known-hosts'}",
+                       "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-b", "-", target,
+                       input=f"ls {path}\n", timeout=40)
+        return rc == 0, f"sftp {target} ls {path}: rc={rc}" + ("" if rc == 0 else f" {out[-200:]}")
+
+    def policy_no():
+        v = W.docker_inspect(pg, "{{.HostConfig.RestartPolicy.Name}}")
+        return v == "no", f"{pg} restart={v or 'no such container'}"
+
+    def pg_parked():
+        e = W.docker_inspect(era, "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}")
+        now = W.docker_inspect(pg, "{{.Name}}")
+        return e == "false no" and now is None, f"{era}={e or 'missing'}; {pg}={'exists' if now else 'free'}"
+
+    def git_cfg():
+        b = str(Path(os.path.expanduser(h["brain_source"])))
+        a = W.sh("git", "-C", b, "config", "--get", "core.checkStat")[1]
+        c = W.sh("git", "-C", b, "config", "--get", "core.trustctime")[1]
+        return (a, c) == ("minimal", "false"), f"core.checkStat={a or '-'} core.trustctime={c or '-'}"
+
+    def status_ok():
+        rc, out = W.sh(*W.gbrainctl(h, "status"), timeout=60)
+        return rc == 0 and "STATUS=ok" in out, out.splitlines()[-1] if out else f"rc={rc}"
+
+    def rerank_ok():
+        # /health probes the primary (4 s when it is down, measured in the drill)
+        j = W.http_json(f"http://127.0.0.1:{h['ports']['rerank']}/health", timeout=15)
+        if drill and j is not None:
+            return True, f"rerank /health answers (drill: no tunnel, primary_ok={j.get('primary_ok')} is advisory)"
+        return bool(j) and j.get("primary_ok") is True, f"rerank :{h['ports']['rerank']}/health {j}"
+
+    def rail_ok():
+        rc, out = W.sh(str(home / "rail.sh"), "search", "somfy blinds", "--limit", "3", timeout=60)
+        return rc == 0 and bool(out.strip()), f"rail.sh rc={rc} {out[:160]!r}"
+
+    def stamp_ok():
+        rc, out = W.sh("docker", "exec", "-u", ug, cron_c, "stat", "-c", "%Y", "/state/last-nightly-sync")
+        try:
+            want = int((home / ".gbrain" / "last-nightly-sync").stat().st_mtime)
+        except FileNotFoundError:
+            return False, f"{home}/.gbrain/last-nightly-sync missing on the host"
+        return rc == 0 and out.strip() == str(want), f"/state/last-nightly-sync mtime={out} host={want}"
+
+    def parity_ok():
+        rc, out = W.sh("docker", "exec", "-u", ug, cron_c, "gbrainjob", "show")
+        line = next((x for x in out.splitlines() if "deploy-parity" in x), "")
+        return rc == 0 and '"ok"' in line.replace("'", '"'), (line or out)[:240]
+
+    def armed_ok():
+        rc, _ = W.sh("docker", "exec", "-u", ug, cron_c, "test", "-e", "/state/ARMED")
+        return rc == 0 and (receipts / "ARMED-AT").exists(), f"/state/ARMED rc={rc}; ARMED-AT {(receipts / 'ARMED-AT').exists()}"
+
+    def watch_ok():
+        rc, out = W.sh(sys.executable, str(W.HERE / "gbrain-stack-watch"), "--host", h["name"], timeout=120)
+        return rc == 0, f"gbrain-stack-watch rc={rc} {out[-300:]}"
+
+    host_stamp = home / ".gbrain" / "last-nightly-sync"
+    return [
+        Step("P1", "pin and images: the three images exist locally, labelled with the pinned revision",
+             readback=images, expect="3 images built at the pin", readonly=True),
+        Step("P2", "rendered .env + secrets for this host (render reads the 1P note; fails naming the key)",
+             cmds=[W.gbrainctl(h, "render")], readback=rendered, expect="every secret file non-empty"),
+        Step("P3", "the hand-run postgres is the one running, restart unless-stopped, no compose label",
+             readback=old_pg, expect=f"{pg} running=true restart=unless-stopped compose_project=-", readonly=True),
+        Step("P4", "launchd-era services are up (what the window replaces)", readback=launchd_running,
+             expect="state = running x3", readonly=True, prod_only=True),
+        Step("P5", "cron rows: launchd-era rows on, the hermes-home PR's new rows present and paused",
+             readback=cron_before, expect="3 enabled, export + stack-watch paused", readonly=True, prod_only=True),
+        Step("P6", "rerank tunnel key: authorized on the reranker host, host key pinned", readback=tunnel_probe,
+             expect="HTTP answer through the new key", readonly=True, prod_only=not h.get("rerank_tunnel")),
+        Step("P7", "NAS key: restic's sftp target answers with the rendered key", readback=nas_probe,
+             expect="rc=0", readonly=True, prod_only=not h.get("nas_backup")),
+        Step("C1", "pause the jobs the cron container replaces; resume the export-only row",
+             cmds=[["hermes", "cron", "pause", W.CRON_NIGHTLY_SYNC], ["hermes", "cron", "pause", W.CRON_PG_BACKUP],
+                   ["hermes", "cron", "pause", W.CRON_DEPLOY_PARITY],
+                   ["hermes", "cron", "resume", W.CRON_OBSERVER_EXPORT]],
+             readback=cron_after_c1, expect="3 paused, export enabled", prod_only=True),
+        Step("C2", "stop + disable the launchd services (plists stay in ~/Library/LaunchAgents)",
+             cmds=[c for lab in W.LAUNCHD_LABELS for c in
+                   (["launchctl", "bootout", f"gui/{uid}/{lab}"], ["launchctl", "disable", f"gui/{uid}/{lab}"])],
+             readback=launchd_off, expect="not-loaded/disabled x3", prod_only=True, downtime_start=not drill),
+        Step("C3", "brain repo: compare mtime+size only (host git and the cron container share the index)",
+             cmds=[["git", "-C", os.path.expanduser(h["brain_source"]), "config", "core.checkStat", "minimal"],
+                   ["git", "-C", os.path.expanduser(h["brain_source"]), "config", "core.trustctime", "false"]],
+             readback=git_cfg, expect="core.checkStat=minimal core.trustctime=false", prod_only=True),
+        Step("C4", f"{pg}: restart policy to `no` FIRST (else a restart starts it beside the compose postgres)",
+             cmds=[["docker", "update", "--restart=no", pg]], readback=policy_no, expect=f"{pg} restart=no",
+             downtime_start=False),
+        Step("C5", f"stop {pg} (shutdown checkpoint) and keep it for the rollback as {era}",
+             cmds=[["docker", "stop", "-t", "60", pg], ["docker", "rename", pg, era]],
+             readback=pg_parked, expect=f"{era}=false no; {pg}=free", downtime_start=drill),
+        # compose up -d, not `gbrainctl up`: up re-renders, i.e. six 1P reads INSIDE the downtime (10.3 s in the drill);
+        # P2 rendered the same files moments ago, and compose refuses an .env that is not rendered for this host
+        Step("C6", "the stack up (compose up -d on P2's render); wait for server /health engine=postgres",
+             cmds=[W.gbrainctl(h, "compose", "--allow-prod", "--", "up", "-d")],
+             run=lambda: W.wait_for(lambda: W.serve_health(h), 240),
+             readback=lambda: W.serve_health(h), expect='{"status":"ok","engine":"postgres"}', downtime_end=True),
+        Step("C7", "gbrainctl status: every container at the pin", readback=status_ok, expect="STATUS=ok",
+             readonly=False),
+        Step("C8", "rerank-proxy health", readback=rerank_ok, expect="primary_ok true"),
+        Step("C9", "warm path answers (rail.sh, what mem0 prefetch uses)", readback=rail_ok, expect="rc=0, hits",
+             prod_only=True),
+        Step("C10", "carry the launchd job's nightly stamp into the cron container's state",
+             cmds=[["sh", "-c", f'docker exec -u {ug} {cron_c} touch -d @$(stat -f %m "{host_stamp}") '
+                                '/state/last-nightly-sync']],
+             readback=stamp_ok, expect="mtimes equal", prod_only=True),
+        Step("C11", "deploy-parity in the cron container", cmds=[["docker", "exec", "-u", ug, cron_c, "gbrainjob",
+                                                                  "run", "deploy-parity"]],
+             readback=parity_ok, expect="deploy-parity result ok", always=True),   # cron-state outlives `down`
+        Step("C12", "arm the cron container (inert until /state/ARMED) and stamp ARMED-AT for the stack watch",
+             cmds=[["docker", "exec", "-u", ug, cron_c, "touch", "/state/ARMED"],
+                   ["touch", str(receipts / "ARMED-AT")]], readback=armed_ok, expect="both present", prod_only=True),
+        Step("C13", "resume the gbrain-stack-watch row", cmds=[["hermes", "cron", "resume", W.CRON_STACK_WATCH]],
+             readback=lambda: W.cron_state_ok({W.CRON_STACK_WATCH: True}), expect="enabled", prod_only=True),
+        Step("C14", "gbrain-stack-watch once", readback=watch_ok, expect="rc=0", prod_only=True,
+             dry_readback=False),   # it writes <receipts_dir>/stack-watch-state.json (the page-once episodes)
+    ]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="gbrain-cutover", description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--host")
+    ap.add_argument("--host-file")
+    ap.add_argument("--stack-dir")
+    ap.add_argument("--apply", action="store_true", help="change things (default: dry run)")
+    ap.add_argument("--drill", action="store_true", help="scratch copy: skip production host-state steps")
+    a = ap.parse_args(argv)
+    if not (a.host or a.host_file):
+        ap.error("--host or --host-file")
+    h = W.load_host(a.host, a.host_file, a.stack_dir)
+    if h["compose_project"] == "gbrain" and a.drill:
+        ap.error("--drill is for a scratch host profile, not the production project")
+    if h["compose_project"] != "gbrain" and not a.drill:
+        ap.error(f"project {h['compose_project']!r} is not production: add --drill")
+    w = W.Window("gbrain-cutover", a.apply, a.drill)
+    rc = w.run_steps(steps(h, a.drill))
+    if rc == 0 and a.apply and not a.drill:
+        w.say("NEXT (not run): after a green night (03:30 nightly-sync + 04:15 pg-backup result lines ok): "
+              f"docker rm {h['pg_container']}{W.LAUNCHD_ERA_SUFFIX}")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

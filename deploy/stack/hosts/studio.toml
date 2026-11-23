@@ -7,13 +7,18 @@ arch            = "arm64"
 docker_host_gw  = "host.docker.internal"   # OrbStack name for the host loopback (mem0's hosts/studio.toml)
 
 # the build every container of this host runs: ANG-Ventures/gbrain-source commit, built per arch by `gbrainctl build`
-# Set by the cutover's pin PR to the master commit that carries deploy/stack (the merge of card t_ab2fcba3's PR).
-# The app code must equal what the launchd serve runs (~/gbrain/app HEAD 9bd1cfeb on 2026-11-20). Until then the
-# placeholder makes `gbrainctl render/build --host studio` refuse, so prod cannot start from an unpinned build.
-revision        = "<master sha that carries deploy/stack>"
-server_image    = "gbrain-server:<sha12>-arm64"
-rerank_image    = "gbrain-rerank:<sha12>-arm64"
-cron_image      = "gbrain-cron:<sha12>-arm64"
+# Pinned by card t_bb0e9194: master 7969d968 = 9bd1cfeb (what ~/gbrain/app serves, read 2026-11-23) + deploy/stack
+# (#10, #11); `git diff 9bd1cfeb 7969d968 -- . ':!deploy/stack'` is empty, so the app code is the launchd serve's.
+revision        = "7969d9685cfb37a2d7c695a6a94d4d4aaa4f4ae7"
+server_image    = "gbrain-server:7969d9685cfb-arm64"
+rerank_image    = "gbrain-rerank:7969d9685cfb-arm64"
+cron_image      = "gbrain-cron:7969d9685cfb-arm64"
+# Built on the Studio by `gbrainctl build --host studio` 2026-11-23 08:3x PT (t_bb0e9194, BUILD=ok in 67 s), each
+# labelled org.opencontainers.image.revision=<revision>, User 502:20. Local image ids (config digests; these images
+# are never pushed, compose runs them with pull_policy: never, so the revision label is what status/watch check):
+#   server sha256:e0c49e16913b9c774dcd7950fc75448e6fab42120d0465dfb0118b14de51cf03
+#   rerank sha256:13e42a9d7d40311b6c508841f28eb8d603daae8950e2b746a4502010dd43a756
+#   cron   sha256:08a02227bc5572943de3113d419066d3da1416ab3695e84c40a158396ed63771
 
 # compose (the checkout `gbrainctl` runs from is the deploy tree; compose files are relative to deploy/stack)
 compose_project = "gbrain"

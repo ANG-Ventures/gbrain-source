@@ -8,7 +8,8 @@ The checks that need the docker socket or the host's GitHub credentials, i.e. wh
   1. every running service of the project carries org.opencontainers.image.revision == hosts/<h>.toml `revision`
      (postgres is the upstream pgvector image and is checked by name + health instead)
   2. that pin == ANG-Ventures/gbrain-source master (`git ls-remote`; --no-github skips; the launchd-era
-     gbrain-deploy-parity.sh check 1, now on the image instead of ~/gbrain/app)
+     gbrain-deploy-parity.sh check 1, now on the image instead of ~/gbrain/app), or master descends from the pin
+     and differs only in HOST_TOOLING (host profiles, host tools, docs, tests: the pin PR's own commit is one)
   3. no stack container bind-mounts application code (the old live-checkout coupling): the only binds allowed are
      the brain repo, the receipts dir and the backup stamp dir
   4. server /health on the published port says engine=postgres; rerank-proxy /health says primary_ok=true (false =
@@ -92,6 +93,28 @@ def page_new(findings: list[tuple[str, str]], state: Path) -> list[str]:
     return [t for k, t in findings if k not in prev]
 
 
+# Paths that never run inside a stack container: the operator's host tools, the host profiles, docs and tests.
+# A master that moved past the pin ONLY in these still runs the pinned code (the pin PR itself is such a commit: the
+# pin names its parent M, so master == P != M by construction, card t_bb0e9194).
+HOST_TOOLING = ("deploy/stack/hosts/", "deploy/stack/tests/", "deploy/stack/README.md", "deploy/stack/gbrainctl",
+                "deploy/stack/gbrain-stack-watch", "deploy/stack/gbrain-cutover", "deploy/stack/gbrain-rollback",
+                "deploy/stack/window_lib.py", "deploy/stack/rollback-launchd.sh")
+
+
+def host_tooling_only(pin: str, master: str, repo: Path = HERE) -> bool:
+    """True when master descends from the pin and every path between them is HOST_TOOLING (read from this checkout
+    after a fetch of master; any git failure -> False, i.e. the parity finding stands)."""
+    try:
+        if sh("git", "-C", str(repo), "fetch", "-q", "origin", master, timeout=90)[0] != 0:
+            return False
+        if sh("git", "-C", str(repo), "merge-base", "--is-ancestor", pin, master)[0] != 0:
+            return False
+        rc, names = sh("git", "-C", str(repo), "diff", "--name-only", pin, master)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return rc == 0 and all(n.startswith(HOST_TOOLING) for n in names.splitlines() if n)
+
+
 def get_json(url, timeout=8):
     # only the stack's own published ports on this host's loopback, over plain http (never file:// or a remote)
     p = urllib.parse.urlsplit(url)
@@ -142,7 +165,7 @@ def main(argv=None) -> int:
         master = ls.split()[0] if rc == 0 and ls else ""
         if not master:
             add("ls-remote", "git ls-remote gbrain-source master FAILED: parity unknown")
-        elif master != pin:
+        elif master != pin and not host_tooling_only(pin, master):
             add(f"parity:{master}", f"pin {pin[:12]} != gbrain-source master {master[:12]}: land a "
                 f"hosts/{a.host}.toml pin PR, gbrainctl build, gbrainctl up")
     try:

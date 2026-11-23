@@ -103,7 +103,9 @@ shared_buffers were colder).
 ## Before the cutover (operator, no downtime)
 
 1. Merge this PR (merge commit M). Then the pin PR: `hosts/studio.toml` `revision` = M, image tags
-   `<M12>-arm64`; merge it (merge commit P). M is what the images are built from; P is what the deploy checkout
+   `<M12>-arm64`; merge it (merge commit P). (Done by t_bb0e9194: M = `7969d968`, which also carries #11; the
+   arm64 images were built on the Studio 2026-11-23, ids in `hosts/studio.toml`. `gbrain-stack-watch` accepts
+   master = P: past the pin only in host tooling.) M is what the images are built from; P is what the deploy checkout
    is on, because only P carries the filled-in host profile (at M it still holds the `<placeholder>` pin and
    build/render refuse). `gbrainctl build` reads `revision` from the profile and builds M itself.
 2. Create the 1P secure note `gbrain stack secrets v1` (Engineering vault) with four `KEY=base64` lines:
@@ -132,7 +134,25 @@ shared_buffers were colder).
    cd ~/gbrain-stack-live/deploy/stack && python3.14 ./gbrainctl build --host studio && python3.14 ./gbrainctl render --host studio
    ```
 
-## Cutover (operator window: expect 15-30 s without gbrain)
+## Cutover (operator window: expect 20-30 s without gbrain)
+
+Scripted (card t_bb0e9194): `python3.14 ./gbrain-cutover --host studio` prints every step below with its readback
+and changes nothing (the P* preflight probes run: images at the pin, render, the hand-run postgres, launchd, cron
+rows, the new tunnel key against ACE-AI, the NAS key); `--apply` runs it and stops at the first readback that is not
+ok. Undo from any point: `python3.14 ./gbrain-rollback --host studio [--apply]`; its launchd step (R4) is queued
+through `~/.hermes/scripts/detached-run.py` (launchctl bootstrap is refused inside an agent gateway) and waited on.
+Run both from a plain terminal in the deploy checkout; the scripts' C*/R* ids map onto the numbered steps here.
+Cron row ids (hermes-home PR): `<export-row>` = `2127ecdb32ee` gbrain-observer-export, `<gbrain-stack-watch row>` =
+`70c54de14efe`; both ship paused.
+
+Drill (2026-11-23, ci-box, t_bb0e9194): the same scripts with `--drill` on a `pg_basebackup` copy of the live
+`gbrain-pg` (29 GB, 48,898 pages, shared_buffers 6GB; prod caps; amd64 images built from the same revision).
+Cutover downtime (stop of the old postgres -> server `/health` engine=postgres) 21.7 s with a re-render inside the
+window, then 17.4 / 21.2 / 17.8 / 17.0 s once C6 ran `compose up -d` on P2's render (the render is ~10 s of 1P
+reads); about 14 s of each is `compose up` waiting on the postgres healthcheck (interval 10 s). `gbrainctl status`
+STATUS=ok rc 0 after every cutover; `gbrain search` from the cron container answered on the copy. Rollback, stack
+down -> old postgres ready: 5.9 / 5.2 / 5.4 / 5.6 / 6.5 s, plus the launchd serve's own start in production (not in
+the drill). Production adds the launchd bootout (C2) and the live shutdown checkpoint.
 
 The proof's stop -> up cycle took 15.5 s to `/health`. Production adds the shutdown checkpoint of the live
 `gbrain-pg` (6 GB shared_buffers; the proof copy's took 0.7 s with a cold cache) and one render through
@@ -175,6 +195,8 @@ docker rm gbrain-pg-launchd-era
 ```
 
 ## Rollback (to the launchd jobs)
+
+Scripted: `gbrain-rollback` (above). By hand:
 
 Each step has its readback; do not start the next step until it prints what the comment says.
 ```

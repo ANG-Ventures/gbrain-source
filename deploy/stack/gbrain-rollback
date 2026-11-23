@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""gbrain-rollback: production gbrain back from the compose stack to the launchd jobs + hand-run gbrain-pg
+(README "Rollback"; card t_bb0e9194). Dry run by default: prints every step with its readback and changes nothing.
+
+  python3.14 ./gbrain-rollback --host studio                # dry run
+  python3.14 ./gbrain-rollback --host studio --apply        # the rollback (operator)
+  python3.14 ./gbrain-rollback --host-file F --stack-dir D --drill --apply   # on a scratch copy
+
+Safe from any point of a stopped or finished cutover: every step reads its own state first and is skipped when it is
+already where the rollback wants it. The data volume is the same in both directions; nothing is migrated.
+R4 (launchd re-registration) does NOT run in this process: `launchctl bootstrap` is refused from inside an agent
+gateway, so it is queued through ~/.hermes/scripts/detached-run.py (launchd's ai.hermes.detached-runner runs
+rollback-launchd.sh outside any gateway) and this script waits on its readback (launchd state + /health).
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import window_lib as W  # noqa: E402
+from window_lib import Step  # noqa: E402
+
+DETACHED_RUN = Path(os.path.expanduser("~/.hermes/scripts/detached-run.py"))
+DETACHED_NAME = "gbrain-rollback-launchd"
+LAUNCHD_SCRIPT = W.HERE / "rollback-launchd.sh"
+
+
+def steps(h: dict, drill: bool) -> list[Step]:
+    proj, pg = h["compose_project"], h["pg_container"]
+    era = pg + W.LAUNCHD_ERA_SUFFIX
+
+    def pre():
+        e = W.docker_inspect(era, "{{.Name}}")
+        p = W.docker_inspect(pg, '{{index .Config.Labels "com.docker.compose.project"}}')
+        if e is not None:
+            return True, f"{era} kept by the cutover: will be renamed back"
+        if p == "":
+            return True, f"{pg} is already the hand-run container (no compose label)"
+        return False, (f"neither {era} nor a hand-run {pg}: the old container was removed (cutover step 6). Recreate "
+                       f"it with the `docker run` of ANG-Ventures/gbrain deploy/gbrain-pg (same image digest, volume "
+                       f"{h['pg_volume']}, port {h['ports']['pg']}) after R2, then re-run this script")
+
+    def pre_detached():
+        ok = DETACHED_RUN.is_file() and LAUNCHD_SCRIPT.is_file()
+        return ok, f"{DETACHED_RUN} {'present' if DETACHED_RUN.is_file() else 'MISSING'}; {LAUNCHD_SCRIPT.name} " \
+                   f"{'present' if LAUNCHD_SCRIPT.is_file() else 'MISSING'}"
+
+    def watch_paused():
+        r = W.cron_rows((W.CRON_STACK_WATCH,))[W.CRON_STACK_WATCH]
+        return r is None or r[0] is False, f"{W.CRON_STACK_WATCH}={'missing' if r is None else r}"
+
+    def stack_gone():
+        c = W.project_containers(proj)
+        return not c, f"project {proj} containers: {' '.join(c) or 'none'}"
+
+    def pg_back():
+        st = W.docker_inspect(pg, "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}} "
+                                  '{{index .Config.Labels "com.docker.compose.project"}}')
+        if st is None:
+            return False, f"no container {pg}"
+        parts = st.split()
+        rc, _ = W.sh("docker", "exec", pg, "pg_isready", "-q", timeout=10)
+        port = W.sh("nc", "-z", "127.0.0.1", str(h["ports"]["pg"]), timeout=5)[0] == 0
+        ok = parts[:2] == ["true", "unless-stopped"] and len(parts) == 2 and rc == 0 and port
+        return ok, (f"{pg} running={parts[0]} restart={parts[1]} compose={parts[2] if len(parts) > 2 else '-'} "
+                    f"pg_isready={'ok' if rc == 0 else rc} port {h['ports']['pg']}={'open' if port else 'closed'}")
+
+    def pg_restore():
+        cmds = []
+        if W.docker_inspect(era, "{{.Name}}") is not None:
+            if W.docker_inspect(pg, "{{.Name}}") is not None:
+                raise W.Stop(f"both {era} and {pg} exist after R2: inspect by hand")
+            cmds.append(["docker", "rename", era, pg])
+        cmds += [["docker", "update", "--restart=unless-stopped", pg], ["docker", "start", pg]]
+        for c in cmds:
+            r = subprocess.run(c, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise W.Stop(f"R3 `{' '.join(c)}` rc={r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+        W.wait_for(pg_back, 120)
+
+    def launchd_back():
+        s = {lab: W.launchd_state(lab) for lab in W.LAUNCHD_LABELS}
+        ok_s, txt_s = W.serve_health(h)
+        j = W.http_json(f"http://127.0.0.1:{h['ports']['rerank']}/health", timeout=15)
+        ok = all(v == "running" for v in s.values()) and ok_s and bool(j) and j.get("primary_ok") is True
+        return ok, " ".join(f"{k}={v}" for k, v in s.items()) + f"; {txt_s}; rerank primary_ok=" + \
+            str(j.get("primary_ok") if j else "no answer")
+
+    def launchd_enqueue():
+        r = subprocess.run([sys.executable, str(DETACHED_RUN), DETACHED_NAME, str(LAUNCHD_SCRIPT)],
+                           capture_output=True, text=True)
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode != 0:
+            raise W.Stop(f"R4 detached-run enqueue rc={r.returncode}: {out[-300:]}")
+        print(f"   | {out[-400:]}", flush=True)
+        ok, text = W.wait_for(launchd_back, 240, every=2)
+        if not ok:
+            raise W.Stop(f"R4 launchd not back within 240 s: {text}; job log: ~/.hermes/var/detached/"
+                         f"{DETACHED_NAME}/ (detached-run.py --status {DETACHED_NAME})")
+
+    def cron_back():
+        return W.cron_state_ok({W.CRON_OBSERVER_EXPORT: False, W.CRON_NIGHTLY_SYNC: True, W.CRON_PG_BACKUP: True,
+                                W.CRON_DEPLOY_PARITY: True})
+
+    return [
+        Step("P1", "the launchd-era postgres is still there to come back to", readback=pre, readonly=True,
+             expect=f"{era} exists (or {pg} is already hand-run)"),
+        Step("P2", "the detached runner (R4 must not run inside this process)", readback=pre_detached,
+             readonly=True, expect="both present", prod_only=True),
+        Step("R1", "silence the stack watch first (else it pages `service NOT RUNNING` hourly)",
+             cmds=[["hermes", "cron", "pause", W.CRON_STACK_WATCH]], readback=watch_paused,
+             expect=f"{W.CRON_STACK_WATCH} paused", prod_only=True),
+        Step("R2", "the stack down (never -v: the data volume is external and stays)",
+             cmds=[W.gbrainctl(h, "down", "--allow-prod")], readback=stack_gone, expect="no project containers",
+             downtime_start=True),
+        Step("R3", f"{era} back as {pg}, restart policy restored, started",
+             show=[f"docker rename {era} {pg}   (when {era} exists)",
+                   f"docker update --restart=unless-stopped {pg}", f"docker start {pg}"],
+             run=pg_restore, readback=pg_back,
+             expect=f"{pg} running=true restart=unless-stopped compose=- pg_isready=ok port open",
+             downtime_end=drill),
+        Step("R4", "launchd jobs re-registered by a DETACHED job (enable + bootstrap x3), then wait for them",
+             show=[f"{sys.executable} {DETACHED_RUN} {DETACHED_NAME} {LAUNCHD_SCRIPT}",
+                   f"(job: launchctl enable + bootstrap gui/{os.getuid()}/<label> for {', '.join(W.LAUNCHD_LABELS)})"],
+             run=launchd_enqueue, readback=launchd_back,
+             expect="state = running x3; serve engine=postgres; rerank primary_ok=True",
+             prod_only=True, downtime_end=not drill),
+        Step("R5", "the launchd-era cron rows back; the export-only row paused",
+             cmds=[["hermes", "cron", "pause", W.CRON_OBSERVER_EXPORT],
+                   ["hermes", "cron", "resume", W.CRON_NIGHTLY_SYNC], ["hermes", "cron", "resume", W.CRON_PG_BACKUP],
+                   ["hermes", "cron", "resume", W.CRON_DEPLOY_PARITY]],
+             readback=cron_back, expect="export paused, 3 enabled", prod_only=True),
+    ]
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="gbrain-rollback", description=__doc__.split("\n", 1)[0])
+    ap.add_argument("--host")
+    ap.add_argument("--host-file")
+    ap.add_argument("--stack-dir")
+    ap.add_argument("--apply", action="store_true", help="change things (default: dry run)")
+    ap.add_argument("--drill", action="store_true", help="scratch copy: skip production host-state steps")
+    a = ap.parse_args(argv)
+    if not (a.host or a.host_file):
+        ap.error("--host or --host-file")
+    h = W.load_host(a.host, a.host_file, a.stack_dir)
+    if h["compose_project"] == "gbrain" and a.drill:
+        ap.error("--drill is for a scratch host profile, not the production project")
+    if h["compose_project"] != "gbrain" and not a.drill:
+        ap.error(f"project {h['compose_project']!r} is not production: add --drill")
+    return W.Window("gbrain-rollback", a.apply, a.drill).run_steps(steps(h, a.drill))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
