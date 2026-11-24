@@ -44,7 +44,7 @@ subnet_of() { docker network inspect "$1_default" -f '{{(index .IPAM.Config 0).S
 
 setup() {
   [[ -z $(git -C "$REPO" status --porcelain -- deploy/stack) ]] || { echo "dirty checkout: the halves run the reviewed bytes" >&2; exit 2; }
-  [[ -s $DATA/a/pg/PG_VERSION ]] || { echo "no copy in $DATA/a/pg (STANDBY.md Drill: seed-copy first)" >&2; exit 2; }
+  sudo -n test -s "$DATA/a/pg/PG_VERSION" || { echo "no copy in $DATA/a/pg (STANDBY.md Drill: seed-copy first)" >&2; exit 2; }
   docker image inspect "$SSHD_IMAGE" >/dev/null
   mkdir -p "$RIG/sshd" "$RIG/state"
   [[ -f $RIG/sshd/ssh_host_ed25519_key ]] || ssh-keygen -q -t ed25519 -N '' -C gbrain-swapdrill-rig -f "$RIG/sshd/ssh_host_ed25519_key"
