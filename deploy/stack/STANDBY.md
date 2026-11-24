@@ -148,7 +148,32 @@ container sharing gbrain-pg's network namespace, `-X stream -r 100M`, its own te
 the Studio, streamed to the NAS and the volume removed: 322 s backup + 469 s transfer, 49,043 pages). Real images
 (amd64 at 7969d968), real 1P render, real rerank tunnel to ACE-AI; the drill cron is never armed and has no NAS key.
 
-DRILL_NUMBERS_PLACEHOLDER
+Measured 2026-11-24 15:10-15:43Z (`drill.sh setup`, `run`, then an undo arm; journals and logs were read before
+`teardown`):
+
+| what | result |
+|---|---|
+| render + init, both halves | `RENDER=ok keys=26 files=10` each (1P read-only token on nas-fleet), `INIT=ok` |
+| A up on the copy | postgres up and answering in 7 s, 49,043 pages; full stack `/health` engine=postgres 5 s later |
+| primary-enable (A accepts B) | `role gbrain_repl_drill_b login=true repl=true`, `hba_loaded 1`, `hba_errors 0`, `key_line present`, `APPLY=ok` |
+| `standby seed` of B, 30 GB through the ssh link | `basebackup rc=0 seconds=309`, `SEED=ok`, 312 s end to end |
+| B's doctor after the seed | `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`, server + cron created at revision 7969d968 == pin, `rerank primary_ok=True` (the GPU host reached from nas-fleet) |
+| swap 1, A -> B (`SWAP=ok steps=8/8`, 676 s) | preflight 0.7 s, fence 4.6 s (`pg_state=shut down`), catchup 0.2 s (replay 7D/A085700 >= checkpoint 7D/A085688), promote 5.2 s, start 4.4 s (`cron_count=1 old_cron_running=0`), flip 4.5 s, prove 57.0 s (the first search on a cold server: 56.8 s, 1 hit), reseed_old 599 s (`STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`) |
+| callers during swap 1 | searches every 0.5 s through A's loopback serve port: 1,302, 35 failed, longest failure window **17.5 s**; writes every 0.5 s: 1,385, 7 failed, longest window 3.5 s; **acked writes 1,378 / 1,378 present on the new primary** |
+| swap 2, B -> A, the swap back (`SWAP=ok steps=8/8`, 542 s) | fence 6.0 s, catchup 0.2 s, promote 4.5 s, start 4.3 s, flip 4.9 s, prove 17.1 s, reseed_old 505 s |
+| callers during swap 2 | searches 1,074, 28 failed, longest window **33.6 s** (the fence to the first answer from A's freshly started server: its first searches ran past the 20 s client timeout); writes 1,126, 10 failed, longest 5.0 s; **acked writes 1,116 / 1,116 present** |
+| after each swap | the new standby's doctor `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`; both serve ports answer engine=postgres and a search (warm: 223-299 ms) |
+| undo arm: swap A -> B with an injected failure at promote, then `swap undo` | `SWAP=failed ... step=promote` (preflight, fence, catchup done); `SWAP=undone primary=drill-a` in 15 s (fence to serving again: 20 s); B stayed a FRESH, ELIGIBLE replica; a second `undo` is a no-op `SWAP=undone` |
+
+What the numbers mean for production:
+- Callers lose ~20-35 s of searches per direction: fence -> start is ~15 s, and a freshly started server answers its
+  first searches slowly (cold caches; 17-57 s for the first in the drill). The mem0 prefetch's gbrain leg times out to
+  `[]` for those turns (it does not fail the turn); rail.sh fails for them.
+- Writes (the cron's imports, OAuth token rows) are refused for ~5 s and none that was acked is lost.
+- reseed_old (a 30 GB staged copy + `pg_verifybackup` + the switch) is 8-10 minutes; there is no standby until it
+  ends. The Studio's base backup is read at `basebackup_rate` (100 MB/s).
+- The production Studio side adds what the drill cannot: OrbStack, the Studio's 6 GB shared_buffers shutdown
+  checkpoint, and a Studio reseed over the real LAN link.
 
 ## 4. Changed on TrueNAS / nas-fleet by t_dd1e1edb
 
@@ -156,6 +181,11 @@ DRILL_NUMBERS_PLACEHOLDER
   settings), hot-plugged into the `nas-fleet` LXC as device `gbrain-standby` at `/srv/gbrain-standby` (`incus config
   device add`; no restart). Rollback: stop the standby, `incus config device remove nas-fleet gbrain-standby`,
   `zfs destroy -r tank/gbrain-standby`.
-- nas-fleet: checkout `~/gbrain-standby` (a clone of a bundle of this branch); the three amd64 images
-  `gbrain-{server,rerank,cron}:7969d9685cfb-amd64` (`gbrainctl build --host nas-fleet`). The drill's projects, volumes,
-  rig and data dir were torn down (`drill.sh teardown`).
+- nas-fleet: checkout `~/gbrain-standby` (a clone of a bundle of this PR's branch); the three amd64 images
+  `gbrain-{server,rerank,cron}:7969d9685cfb-amd64` (`gbrainctl build --host nas-fleet`, BUILD=ok); `gbrainctl render
+  --host nas-fleet` (RENDER=ok keys=26 files=10) and `gbrainctl standby init --host nas-fleet` (INIT=ok: the link key,
+  the replication password + its SCRAM verifier in `deploy/stack/secrets/standby/` 0600, docker volume
+  `gbrainstandby_pg` bound to `/srv/gbrain-standby/pg`, an empty brain repo at `/srv/gbrain-standby/gbrain/brain`).
+  Nothing is started: the doctor reads `STANDBY=STALE lag_s=unknown ELIGIBLE=no reason=replica postgres is not
+  running` until step 3 + 4. A re-run of `init` prints the same key line and verifier (both are kept).
+  The drill's projects, volumes, rig and data dir were removed (teardown read back 0 containers, 0 volumes).
