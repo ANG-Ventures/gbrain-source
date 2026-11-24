@@ -342,7 +342,7 @@ def test_promote_reproves_catchup_against_the_current_fence_checkpoint(tmp_path)
     assert [c[0] for c in target.calls] == ["_status", "_catchup", "_promote"]
     assert target.calls[1][1][:2] == ("--checkpoint-lsn", "7E/100")      # the re-fenced checkpoint, not the saved one
     assert sw.st["fence"]["checkpoint_lsn"] == "7E/100" and r["checkpoint_lsn"] == "7E/100"
-    assert sw.st["promote_started"]
+    assert sw.st["promote_started"]["checkpoint_lsn"] == "7E/100"
 
 
 def test_promote_resume_after_an_unjournaled_promotion(tmp_path):
@@ -353,9 +353,15 @@ def test_promote_resume_after_an_unjournaled_promotion(tmp_path):
     target = _FakeSide("nas-fleet", {"_status": {"pg": {"in_recovery": False}},
                                      "_promote": {"pg_in_recovery": False}})
     st = {"steps": {"fence": {}, "catchup": {}}, "fence": {"checkpoint_lsn": "7E/100", "was_armed": True},
-          "promote_started": "2026-11-24T16:20:00Z"}
+          "promote_started": {"at": "2026-11-24T16:20:00Z", "checkpoint_lsn": "7E/100"}}
     r = SW.Swap(sid, st, target, old, old, tmp_path).s_promote()
     assert [c[0] for c in target.calls] == ["_status", "_promote"] and r["resumed_after_promote"]
+    # the old primary moved after the proof (re-fence reads a newer checkpoint): no automatic resume (Prism ef0d99a7f1ee)
+    target.calls.clear()
+    st["promote_started"] = {"at": "2026-11-24T16:20:00Z", "checkpoint_lsn": "7E/80"}
+    with pytest.raises(SW.StepFail, match="no automatic resume"):
+        SW.Swap(sid, st, target, old, old, tmp_path).s_promote()
+    assert [c[0] for c in target.calls] == ["_status"]
     # the same primary target with no promote_started marker: this swap did not promote it, refuse
     target.calls.clear()
     del st["promote_started"]
@@ -378,6 +384,8 @@ def test_primary_enable_replaces_tagged_lines_and_drops_any_slot():
     assert 'if [[ $cur != "$HBA" ]]; then' in t and 'if [[ $have != "$want" ]]; then' in t
     assert "address='$gw' and netmask='255.255.255.255'" in t
     assert "where slot_name = '$slot' and not active" not in t
+    # the key file is staged by mktemp beside it and renamed over it: no predictable staging path (Prism 7ecee0da30fc)
+    assert 'tmp=$(sudo -n mktemp "$KEYS.XXXXXXXX")' in t and '"$KEYS.new"' not in t and "$KEYS.tmp" not in t
 
 
 def test_reseed_moves_no_file_while_postgres_still_runs(monkeypatch):
@@ -407,3 +415,16 @@ def test_reseed_moves_no_file_while_postgres_still_runs(monkeypatch):
     assert rc == 1
     assert SB.switch_script() not in scripts and SB.restore_script() not in scripts
     assert ["stop", "postgres"] in composes
+
+
+def test_fence_guard_matches_the_standby_overlay_command(monkeypatch):
+    """Prism 9caefce1c941: the fence leaves the stopped postgres container on the overlay's guarded command; the
+    check it uses must accept exactly that command and refuse the primary's plain one."""
+    t = (STACK / "docker-compose.standby.yaml").read_text()
+    m = re.search(r"^  postgres:\n.*?command:\n\s+- >-\n(.*?)(?=\n\n|\n  \S)", t, re.M | re.S)
+    cmd = " ".join(ln.strip() for ln in m.group(1).splitlines())
+    CP = subprocess.CompletedProcess
+    monkeypatch.setattr(SW, "run", lambda argv, **k: CP(argv, 0, json.dumps([cmd]) + "\n", ""))
+    assert SW.pg_guarded("gbrain-pg")
+    monkeypatch.setattr(SW, "run", lambda argv, **k: CP(argv, 0, json.dumps(["postgres"]) + "\n", ""))
+    assert not SW.pg_guarded("gbrain-pg")

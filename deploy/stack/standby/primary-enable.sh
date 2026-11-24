@@ -73,6 +73,21 @@ SQL
   case $st in present|ABSENT) echo "key_line $st ($KEYS)" ;; *) echo "key_line UNREADABLE ($KEYS, rc=${st#UNREADABLE:})" ;; esac
 }
 
+# keys_replace: stdin becomes $KEYS. The staging file is made by mktemp (O_EXCL: it never follows an existing link,
+# Prism 7ecee0da30fc) in the key file's own directory, given the live file's owner and mode, then renamed over it, so
+# the live file is never truncated (Prism 41289be4a5f6). GNU stat first (BSD stat rejects -c with
+# nothing on stdout; GNU `stat -f` prints a filesystem dump even when it fails).
+keys_replace() {
+  local tmp own mode
+  tmp=$(sudo -n mktemp "$KEYS.XXXXXXXX") || { echo "cannot stage beside $KEYS" >&2; exit 3; }
+  own=$(sudo -n stat -c '%u:%g' "$KEYS" 2>/dev/null || sudo -n stat -f '%u:%g' "$KEYS")
+  mode=$(sudo -n stat -c '%a' "$KEYS" 2>/dev/null || sudo -n stat -f '%Lp' "$KEYS")
+  if ! { sudo -n tee "$tmp" >/dev/null && sudo -n chown "$own" "$tmp" && sudo -n chmod "$mode" "$tmp" \
+         && sudo -n mv -f "$tmp" "$KEYS"; }; then
+    sudo -n rm -f "$tmp"; echo "writing $KEYS failed: the live file is unchanged" >&2; exit 3
+  fi
+}
+
 apply() {
   : "${STANDBY_KEY_LINE:?set from gbrainctl standby init}" "${STANDBY_REPL_VERIFIER:?set from gbrainctl standby init}"
   [[ $STANDBY_REPL_VERIFIER =~ ^SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$ ]] \
@@ -144,9 +159,7 @@ SQL
     # same shape as pg_hba: a private sibling with the live file's owner and mode, renamed over it only after the
     # write succeeded; the live file is never truncated (Prism 41289be4a5f6)
     sudo -n cp -p "$KEYS" "$KEYS.pre-gbrain-standby"
-    sudo -n cp -p "$KEYS" "$KEYS.new"
-    { [[ -z $body ]] || grep -vF -- "$MARK" <<<"$body" || true; printf '%s\n' "$want"; } | sudo -n tee "$KEYS.new" >/dev/null
-    sudo -n mv -f "$KEYS.new" "$KEYS"
+    { [[ -z $body ]] || grep -vF -- "$MARK" <<<"$body" || true; printf '%s\n' "$want"; } | keys_replace
   fi
   check
   echo "APPLY=ok (next, on the standby: gbrainctl standby seed --host <standby>)"
@@ -170,7 +183,7 @@ do \$\$ begin
 end \$\$;
 SQL
   if keys_has_mark; then
-    sudo -n sh -c "cp -p '$KEYS' '$KEYS.tmp' && { grep -vF '$MARK' '$KEYS' || true; } > '$KEYS.tmp' && mv -f '$KEYS.tmp' '$KEYS'"
+    { grep -vF -- "$MARK" <<<"$(sudo -n cat "$KEYS")" || true; } | keys_replace
   fi
   check
   echo "UNDO=ok"

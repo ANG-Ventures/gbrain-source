@@ -307,7 +307,22 @@ def v_fence(L: Local, a) -> dict:
     out.update({"pg_state": cd["state"], "checkpoint_lsn": cd["checkpoint_lsn"], "timeline": cd["timeline"]})
     if cd["state"] != "shut down":
         raise StepFail(f"fence: pg_controldata says {cd['state']!r}, not 'shut down' (not a clean stop)")
+    # The stopped container still carries the primary's entrypoint: `compose restart postgres` (or `docker start`)
+    # would bring the old cluster back writable. Recreate it, NOT started, from the standby composition (ROLE=standby
+    # is written above), whose entrypoint refuses to start without standby.signal (Prism 9caefce1c941).
+    if not pg_guarded(pgc["name"]):
+        L.compose("up", "--no-start", "--no-deps", "--force-recreate", "postgres", timeout=600)
+        pgc = L.ctr("postgres")
+        if not (pgc and not pgc["running"] and pg_guarded(pgc["name"])):
+            raise StepFail("fence: the stopped postgres container is not the standby-guarded one after recreate")
+    out["pg_guarded"] = True
     return out
+
+
+def pg_guarded(name: str) -> bool:
+    """The container's command is the standby overlay's guard (exit 78 without standby.signal)."""
+    r = run(["docker", "inspect", "-f", "{{json .Config.Cmd}}", name])
+    return r.returncode == 0 and "standby.signal" in r.stdout and "exit 78" in r.stdout
 
 
 def v_unfence(L: Local, a) -> dict:
@@ -758,16 +773,25 @@ class Swap:
             # Resume after _promote ran but its result was not journaled (Prism 3cd6acbcced2): there is no replay
             # position left to prove, and the catchup was proven before promote_started was written. Without that
             # marker a primary target means something else promoted it: refuse.
-            if not self.st.get("promote_started"):
+            ps = self.st.get("promote_started")
+            if not ps:
                 raise StepFail(f"promote: {self.target.name} is already a primary and this swap never started "
                                f"its promotion: refusing")
+            # the old primary must not have moved past what the target proved it replayed: a newer fence checkpoint
+            # means it wrote after that proof, and those writes are not on the promoted target (Prism ef0d99a7f1ee)
+            proven = ps.get("checkpoint_lsn") if isinstance(ps, dict) else None
+            if not proven or proven != f.get("checkpoint_lsn"):
+                raise StepFail(f"promote: {self.target.name} was promoted after proving checkpoint {proven}, but "
+                               f"{self.old.name}'s fence checkpoint is now {f.get('checkpoint_lsn')}: it may hold "
+                               f"writes the new primary lacks; resolve by hand, no automatic resume")
             chk = self.recheck_fenced("promote")
-            self.log("promote_resumed", promote_started=self.st["promote_started"])
+            self.log("promote_resumed", promote_started=ps)
             return {**self.target.call("_promote", timeout=900), **chk, "resumed_after_promote": True,
                     "checkpoint_lsn": f.get("checkpoint_lsn")}
         cu = self.s_catchup()
         chk = self.recheck_fenced("promote")
-        self.st["promote_started"] = now()
+        self.st["promote_started"] = {"at": now(), "checkpoint_lsn": f.get("checkpoint_lsn"),
+                                      "replay_lsn": cu.get("replay_lsn")}
         self.save()
         return {**self.target.call("_promote", timeout=900), **chk, "catchup_replay_lsn": cu.get("replay_lsn"),
                 "checkpoint_lsn": f.get("checkpoint_lsn")}
