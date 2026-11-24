@@ -33,6 +33,9 @@ Files (mem0-selfhost-deploy's shapes, read its `bin/mem0ctl`, `hosts/*.toml`, `s
 * `gbrain-stack-watch` the host-side monitor (docker + GitHub checks the containers cannot do; pages on failed job
   results, the rerank fallback, DeepInfra 401/402 and a stopped rerank-tunnel; once per episode, open findings kept in
   `<receipts_dir>/stack-watch-state.json`). `tests/test_stack.py` the static contract.
+* `STANDBY.md` the warm standby on nas-fleet (`gbrainctl standby`) and the one swap command (`gbrainctl swap`), card
+  t_dd1e1edb: `hosts/nas-fleet.toml`, `docker-compose.{standby,nas-fleet}.yaml`, `standby/` (primary-enable.sh, the
+  drill), `tests/test_standby.py`.
 
 ## Operating
 

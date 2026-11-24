@@ -167,15 +167,18 @@ run() {  # the whole drill after setup: swap to B under load, swap back to A und
 }
 
 teardown() {
-  for x in b a; do
-    [[ -f $(prof $x) ]] && { cx "$(prof $x)" --profile promoted down --remove-orphans -t 30 >/dev/null 2>&1 || true; }
+  # by compose label, not `gbrainctl compose -- down`: gbrainctl refuses a leading global flag (--profile), so the
+  # promoted-profile server/cron would be left behind; containers go first, then volumes, then the data
+  local p
+  for p in gbrain-swapdrill-b gbrain-swapdrill-a; do
+    docker ps -aq --filter "label=com.docker.compose.project=$p" | xargs -r docker rm -f >/dev/null
+    docker network rm "${p}_default" >/dev/null 2>&1 || true
   done
   docker rm -f gbrain-swapdrill-sshd >/dev/null 2>&1 || true
-  docker volume rm -f gbrainswapdrill_a_pg gbrainswapdrill_b_pg gbrain-swapdrill-a_cron-state gbrain-swapdrill-a_gbrain-home \
-    gbrain-swapdrill-b_cron-state gbrain-swapdrill-b_gbrain-home >/dev/null 2>&1 || true
+  docker volume ls -q | grep -E '^gbrain-?swapdrill' | xargs -r docker volume rm >/dev/null
   sudo -n rm -rf "$DATA"
   rm -rf "$RIG"
-  echo "TEARDOWN=ok"
+  echo "TEARDOWN=ok left: containers=$(docker ps -a --format '{{.Names}}' | grep -c swapdrill) volumes=$(docker volume ls -q | grep -cE '^gbrain-?swapdrill')"
 }
 
 case ${1:-} in

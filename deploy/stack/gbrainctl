@@ -11,6 +11,10 @@ lib/mem0ctl/{render,compose,up}.py), one stdlib-only file (python >= 3.11 for to
   gbrainctl build   --host H [--repo DIR] build the host's three images from a CLEAN detached worktree at the
                                           host file's `revision` (never the caller's tree), for the host's arch
   gbrainctl status  --host H              compose ps + each running container's revision label vs the pin
+  gbrainctl standby init|seed|status|repin --host H    the warm standby (gbrain_standby.py, STANDBY.md)
+  gbrainctl swap --to H [--dry-run] | resume|undo|status <id>   the one swap command (gbrain_swap.py, STANDBY.md)
+
+<stack>/ROLE (written only by `swap`) adds or drops docker-compose.standby.yaml from the profile's compose_files.
 
 Refusals: on the production project (`gbrain`) `up`, `down` and every `compose` subcommand that is not read-only
 (anything outside READ_ONLY_COMPOSE: down, stop, rm, restart, kill, up, exec, run, ...) need --allow-prod.
