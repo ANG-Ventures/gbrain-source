@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -683,10 +684,49 @@ def reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf) -> int:
     return 0
 
 
+def local_primary_problem(host: dict) -> str | None:
+    """A postgres that runs here and is not a replica is a live primary: never seed over it (read F2). Unreadable
+    counts as a primary. A stopped or restart-looping (guarded, exit 78) container is not running."""
+    c = container(host["compose_project"], "postgres")
+    if not (c and c["status"] == "running"):
+        return None
+    rc, out, err = psql(c["name"], "select pg_is_in_recovery();")
+    if rc == 0 and out == "t":
+        return None
+    return f"postgres {c['name']} runs here and is not a replica (in_recovery={out if rc == 0 else 'unreadable'})"
+
+
+class seed_lock:
+    """One seed per stack dir: a resumed reseed must not run beside one still running (a killed coordinator leaves
+    the remote seed alive; the second would delete the first's staging under its base backup; read F6)."""
+    def __init__(self, stack: Path):
+        self.p = stack / ".seed.lock"
+
+    def __enter__(self):
+        self.f = open(self.p, "a")
+        try:
+            fcntl.flock(self.f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.f.close()
+            die(f"another `standby seed` holds {self.p}: let it finish (or stop it) first", 3)
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
 def cmd_seed(host: dict, sb: dict, stack: Path, reseed: bool) -> int:
+    with seed_lock(stack):
+        return seed_locked(host, sb, stack, reseed)
+
+
+def seed_locked(host: dict, sb: dict, stack: Path, reseed: bool) -> int:
     pwf = sdir(stack) / "repl_password"
     if not pwf.exists():
         die("no replication password: run `gbrainctl standby init` first")
+    bad = local_primary_problem(host)
+    if bad:
+        die(f"{bad}: refusing to seed over a live primary", 3)
     proj = host["compose_project"]
     net = f"{proj}_default"
     pg_image = pg_image_of(stack)
@@ -721,6 +761,12 @@ def cmd_seed(host: dict, sb: dict, stack: Path, reseed: bool) -> int:
         if have.returncode:
             die(f"cannot query the primary as {sb['repl_role']}: {have.stderr.strip()[-200:]}", 4)
         if has:
+            # the copy replaces a cluster: its source must be a promoted primary, not another replica (read F2)
+            src = run(["docker", "run", "--rm", "--network", net, "--env-file", envf, pg_image, "psql", "-X", "-At",
+                       "-d", conn, "-c", "select pg_is_in_recovery()"])
+            if src.returncode or src.stdout.strip() != "f":
+                die(f"--reseed: the source through primary-link is not a primary (in_recovery="
+                    f"{src.stdout.strip() if src.returncode == 0 else 'unreadable'}): refusing to replace {vol}", 3)
             if reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf):
                 return 1
         else:

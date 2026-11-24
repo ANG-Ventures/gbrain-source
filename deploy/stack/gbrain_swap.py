@@ -35,7 +35,8 @@ its `[swap] ssh` in its stack_dir). Steps, each journaled:
   7 prove       on the callers' host: /health engine=postgres and a real MCP `search` returning hits, through the
                 loopback port the callers use
   8 reseed_old  the old host re-seeds as the new standby (`standby seed --reseed`), doctor polled until it follows
-Undo (old primary back) only while the target is still in recovery; after promote only resume. Last line
+Undo (old primary back) only before promote_started is journaled (the promotion may still finish on its own after
+that, even when its answer was lost); from there only resume. Last line
 SWAP=ok|failed|refused|undone|dry-run id=<id> ... Exit 0 ok, 1 step failed, 2 usage, 3 refused.
 """
 from __future__ import annotations
@@ -71,6 +72,12 @@ HEALTH_WAIT_S = 300
 RESEED_SETTLE_S = 300
 STOP_GRACE_S = 30
 PROVE_QUERY = "gbrain standby swap"
+SCRAM_RE = re.compile(r"SCRAM-SHA-256\$[^\s'\"|,;)]+")
+
+
+def scrub(text: str) -> str:
+    """No SCRAM verifier in a journal, a SIDE= error or a step result (psql's CONTEXT line quotes the statement)."""
+    return SCRAM_RE.sub("SCRAM-SHA-256$<redacted>", text)
 
 
 class Refused(Exception):
@@ -456,12 +463,16 @@ def v_primary_enable(L: Local, a) -> dict:
     keys = (L.host.get("link") or {}).get("keys_file")
     if not keys:
         raise StepFail(f"{L.host['_file']}: [link] keys_file unset: where this host's link sshd reads its keys")
+    # the verifier arrives on stdin, never argv (ps shows argv on both hosts, ssh's remote command too)
+    verifier = sys.stdin.readline().strip()
+    if not verifier.startswith("SCRAM-SHA-256$"):
+        raise StepFail("primary-enable: no SCRAM verifier on stdin")
     pgc = L.ctr("postgres")
-    env = dict(os.environ, STANDBY_KEY_LINE=a.key_line, STANDBY_REPL_VERIFIER=a.verifier, STANDBY_REPL_ROLE=a.role,
+    env = dict(os.environ, STANDBY_KEY_LINE=a.key_line, STANDBY_REPL_VERIFIER=verifier, STANDBY_REPL_ROLE=a.role,
                STANDBY_SLOT=a.slot, STANDBY_MARK=f"# gbrain-standby {a.mark or a.slot}",
                STANDBY_KEYS=os.path.expanduser(keys), GBRAIN_PG_CONTAINER=pgc["name"] if pgc else "")
     r = run(["bash", str(HERE / "standby" / "primary-enable.sh"), "apply"], env=env, timeout=300)
-    tail = (r.stdout + r.stderr).strip().splitlines()[-10:]
+    tail = [scrub(ln) for ln in (r.stdout + r.stderr).strip().splitlines()[-10:]]
     if r.returncode or "APPLY=ok" not in r.stdout:
         raise StepFail("primary-enable apply failed: " + " | ".join(tail)[-400:])
     return {"applied": True, "tail": tail}
@@ -541,15 +552,44 @@ def v_prove(L: Local, a) -> dict:
     return {"health": h, "query": q, "hits": n, "search_ms": ms, "client": Path(envp).name}
 
 
-def v_reseed(L: Local, _a) -> dict:
-    L.write_role("standby")
-    (L.stack / FENCE_FILE).unlink(missing_ok=True)   # past the point of undo: this host is a standby now
+def reseed_problems(L: Local, sid: str) -> list[str]:
+    """Why this host's cluster may NOT be discarded for swap <sid>: it must still be that swap's fenced old primary
+    (FENCE names the swap, ROLE=standby, no server or cron) and its postgres must not run as a primary. A host put back
+    by hand, or an old command from scrollback, reads as one of these."""
+    p = []
+    rec = read_fence(L)
+    if not rec or rec.get("swap_id") != sid:
+        p.append(f"FENCE names swap {rec.get('swap_id') if rec else None}, not {sid}")
+    if L.role() != "standby":
+        p.append(f"ROLE={L.role()!r} (want standby)")
+    live = [s for s in ("server", "cron") if L.running(s)]
+    if live:
+        p.append("runs " + ",".join(live))
+    c = L.ctr("postgres")
+    if c and c["state"] == "running":
+        rc, out, _ = L.psql("select pg_is_in_recovery();")
+        if not (rc == 0 and out == "t"):
+            p.append(f"postgres runs and is not a replica (in_recovery={out if rc == 0 else 'unreadable'})")
+    return p
+
+
+def v_reseed(L: Local, a) -> dict:
+    sid = need_sid(a)
+    with host_lock(L):
+        bad = reseed_problems(L, sid)
+    if bad:
+        raise StepFail(f"reseed refused on {L.host['name']}: {'; '.join(bad)}: it is not the fenced old primary of "
+                       f"swap {sid}, so its cluster is not discarded (STANDBY.md \"Promoted but not serving\")")
     t0 = time.time()
     r = run([sys.executable, str(HERE / "gbrainctl"), "standby", "seed", "--reseed", *profile_args(L.host)],
             timeout=4 * 3600)
     tail = (r.stdout + r.stderr).strip().splitlines()[-8:]
-    if r.returncode:
+    if r.returncode or not any(ln.startswith("SEED=ok") for ln in tail):
         raise StepFail("standby seed --reseed failed: " + " | ".join(tail)[-500:])
+    with host_lock(L):   # past the point of undo only now: the host streams as the new standby (SEED=ok)
+        rec = read_fence(L)
+        if rec and rec.get("swap_id") == sid:
+            (L.stack / FENCE_FILE).unlink(missing_ok=True)
     return {"seconds": round(time.time() - t0), "tail": tail}
 
 
@@ -567,7 +607,7 @@ def side_main(verb: str, argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog=f"gbrainctl swap {verb}")
     ap.add_argument("--host")
     ap.add_argument("--host-file")
-    for k in ("checkpoint-lsn", "key-line", "verifier", "role", "slot", "mark", "client-env", "query"):
+    for k in ("checkpoint-lsn", "key-line", "role", "slot", "mark", "client-env", "query"):
         ap.add_argument(f"--{k}")
     ap.add_argument("--swap-id")
     ap.add_argument("--arm", choices=("yes", "no"), default="no")
@@ -577,10 +617,10 @@ def side_main(verb: str, argv: list[str]) -> int:
         host = SB.load(a.host, a.host_file)
         res = VERBS[verb](Local(host), a)
     except FenceHeld as e:
-        print("SIDE=" + json.dumps({"ok": False, "refused": True, "error": str(e)[-600:]}))
+        print("SIDE=" + json.dumps({"ok": False, "refused": True, "error": scrub(str(e))[-600:]}))
         return 3
     except (StepFail, RenderError, subprocess.SubprocessError, OSError, KeyError) as e:
-        print("SIDE=" + json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"[-600:]}))
+        print("SIDE=" + json.dumps({"ok": False, "error": scrub(f"{type(e).__name__}: {e}")[-600:]}))
         return 1
     print("SIDE=" + json.dumps({"ok": True, **res}, default=str))
     return 0
@@ -613,7 +653,7 @@ class Side:
         self.remote = sw.get("ssh") if sw.get("ssh") and not this_box(host.get("lan_ip", "")) else None
         self.python = sw.get("python") or "python3"
 
-    def call(self, verb: str, *args: str, timeout: int = 900) -> dict:
+    def call(self, verb: str, *args: str, timeout: int = 900, stdin: str | None = None) -> dict:
         cmd = [verb, *profile_args(self.host), *args]
         if not self.remote:
             argv = [sys.executable, str(HERE / "gbrainctl"), "swap", *cmd]
@@ -623,14 +663,14 @@ class Side:
             remote = f"cd {sd} && {shlex.quote(self.python)} ./gbrainctl swap " + " ".join(shlex.quote(c) for c in cmd)
             argv = ["ssh", *SSH_OPTS, self.remote, "bash -c " + shlex.quote(remote)]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=stdin or "")
         except subprocess.TimeoutExpired:
             raise StepFail(f"{self.name} {verb}: no answer in {timeout}s")
         if self.remote and r.returncode == 255 and any(s in r.stderr.lower() for s in NO_ANSWER):
             raise Unreachable(f"{self.name}: ssh {self.remote}: {r.stderr.strip()[-200:]}")
         line = next((ln for ln in reversed(r.stdout.splitlines()) if ln.startswith("SIDE=")), None)
         if not line:
-            raise StepFail(f"{self.name} {verb} rc={r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}")
+            raise StepFail(scrub(f"{self.name} {verb} rc={r.returncode}: {(r.stderr or r.stdout).strip()[-300:]}"))
         res = json.loads(line[5:])
         if not res.get("ok"):
             if res.get("refused"):
@@ -808,9 +848,9 @@ class Swap:
 
     def s_flip(self):
         inp = self.old.call("_inputs", timeout=300)
-        pe = self.target.call("_primary_enable", "--key-line", inp["key_line"], "--verifier", inp["verifier"],
-                              "--role", inp["role"], "--slot", inp["slot"], "--mark", inp.get("mark") or inp["slot"],
-                              timeout=600)
+        pe = self.target.call("_primary_enable", "--key-line", inp["key_line"], "--role", inp["role"],
+                              "--slot", inp["slot"], "--mark", inp.get("mark") or inp["slot"],
+                              stdin=inp["verifier"] + "\n", timeout=600)
         lk = self.old.call("_link_up", timeout=300)
         return {"primary_enable": pe["tail"][-2:], "old_link": lk}
 
@@ -821,7 +861,7 @@ class Swap:
     def s_reseed_old(self):
         o = self.old
         if self.st.get("no_reseed"):
-            cmds = [f"# on {o.name}: ./gbrainctl swap _reseed {' '.join(profile_args(o.host))}"]
+            cmds = [f"# on {o.name}: ./gbrainctl swap _reseed {' '.join(profile_args(o.host))} --swap-id {self.id}"]
             print("  reseed_old not run (--no-reseed); the command:")
             for c in cmds:
                 print("    " + c)
@@ -832,7 +872,7 @@ class Swap:
             doc = {"eligible": False}
         rs = {"seconds": 0, "skipped": "already a FRESH standby of this primary (a resume)"}
         if not following(doc):
-            rs = o.call("_reseed", timeout=4 * 3600 + 600)
+            rs = o.call("_reseed", "--swap-id", self.id, timeout=4 * 3600 + 600)
         t0 = time.time()
         while True:
             doc = o.call("_doctor", timeout=300)
@@ -864,11 +904,12 @@ class Swap:
                 print(f"SWAP=refused id={self.id} step={step} reason={e}")
                 return 3
             except (StepFail, Unreachable, RenderError) as e:
+                err = scrub(str(e))
                 self.st["state"] = "failed"
-                self.st["error"] = str(e)
+                self.st["error"] = err
                 self.save()
-                self.log("step_failed", step=step, error=str(e))
-                print(f"SWAP=failed id={self.id} step={step} reason={e}")
+                self.log("step_failed", step=step, error=err)
+                print(f"SWAP=failed id={self.id} step={step} reason={err}")
                 print(f"  next: {self.next_hint(step)}")
                 return 1
             self.st["steps"][step] = {"seconds": round(time.time() - t0, 1), "at": now(), "result": res}
@@ -885,13 +926,23 @@ class Swap:
         if step == "preflight" or (step == "fence" and not self.st.get("fence")):
             return (f"fix the cause, then `gbrainctl swap resume {self.id}`; or `gbrainctl swap undo {self.id}` "
                     f"(the fence may have stopped part of {self.old.name})")
-        if not self.done("promote"):
+        if not self.done("promote") and not self.st.get("promote_started"):
             return (f"`gbrainctl swap resume {self.id}` (continues), or `gbrainctl swap undo {self.id}` (restarts "
-                    f"{self.old.name} as the primary; allowed while {self.target.name} is still a replica)")
-        return (f"`gbrainctl swap resume {self.id}` only: {self.target.name} is promoted, so undo would lose writes; "
-                f"back = a second swap once {self.old.name} is a standby again")
+                    f"{self.old.name} as the primary; allowed until the promotion of {self.target.name} starts)")
+        return (f"`gbrainctl swap resume {self.id}` only: the promotion of {self.target.name} started, so undo could "
+                f"make two primaries or lose writes; back = a second swap once {self.old.name} is a standby again "
+                f"(STANDBY.md \"Promoted but not serving\" when resume cannot finish)")
 
     def undo(self) -> int:
+        ps = self.st.get("promote_started")
+        if ps or self.done("promote"):
+            # the promotion may still be running on the target (a killed coordinator leaves the remote _promote
+            # alive; pg_promote(true, 60) can answer f and still finish): one in_recovery read cannot prove it will not
+            # become a primary after the old one is unfenced (read F1)
+            at = ps.get("at") if isinstance(ps, dict) else None
+            print(f"SWAP=refused id={self.id} reason=the promotion of {self.target.name} started ({at}): undo could "
+                  f"leave two primaries; `gbrainctl swap resume {self.id}` is the only way on")
+            return 3
         try:
             ts = self.target.call("_status", timeout=120)
         except (StepFail, Unreachable) as e:

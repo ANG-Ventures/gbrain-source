@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 .env
 secrets/
+# swap/standby state, written by `gbrainctl swap` / `standby seed` on the host itself; never tracked (read F3)
+ROLE
+FENCE
+FENCE.tmp
+.fence.lock
+.seed.lock

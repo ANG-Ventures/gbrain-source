@@ -224,7 +224,8 @@ def test_compose_refuses_mutating_verb_on_prod_without_allow_prod(prod_stack, ca
 def test_compose_runs_mutating_verb_on_prod_with_allow_prod(prod_stack, verb):
     hf, stack, log = prod_stack
     rc = gbrainctl.main(["compose", "--host-file", str(hf), "--stack-dir", str(stack), "--allow-prod", "--", verb])
-    assert rc == 0 and log.read_text().split("\n")[0].endswith(f" {verb}")
+    compose = [ln for ln in log.read_text().split("\n") if ln.startswith("compose ")]   # after the fence guard's reads
+    assert rc == 0 and compose[0].endswith(f" {verb}")
 
 
 @pytest.mark.parametrize("verb", READ_ONLY)

@@ -321,8 +321,8 @@ class _FakeSide:
     def __init__(self, name, answers):
         self.name, self.answers, self.calls = name, answers, []
 
-    def call(self, verb, *args, timeout=0):
-        self.calls.append((verb, args))
+    def call(self, verb, *args, timeout=0, stdin=None):
+        self.calls.append((verb, args) if stdin is None else (verb, args, stdin))
         a = self.answers[verb]
         return a(args) if callable(a) else dict(a)
 
@@ -428,3 +428,207 @@ def test_fence_guard_matches_the_standby_overlay_command(monkeypatch):
     assert SW.pg_guarded("gbrain-pg")
     monkeypatch.setattr(SW, "run", lambda argv, **k: CP(argv, 0, json.dumps(["postgres"]) + "\n", ""))
     assert not SW.pg_guarded("gbrain-pg")
+
+
+# ---------------------------------------------------------------- send-back 2 (independent read F1-F6, t_dd1e1edb)
+
+SID = "20261124T180000Z-to-nas-fleet"
+
+
+def test_undo_refused_once_promote_started(tmp_path, capsys):
+    """F1: the coordinator died inside promote (or pg_promote answered f): the target still reads in recovery, but its
+    promotion may finish after the old primary is unfenced. undo must refuse on the journal marker, not on that read."""
+    old = _FakeSide("studio", {"_unfence": {"pg_in_recovery": False}})
+    target = _FakeSide("nas-fleet", {"_status": {"pg": {"in_recovery": True}}})
+    st = {"state": "failed", "steps": {"preflight": {}, "fence": {}, "catchup": {}},
+          "promote_started": {"at": "2026-11-24T18:01:00Z", "checkpoint_lsn": "7E/100"}}
+    sw = SW.Swap(SID, st, target, old, old, tmp_path)
+    assert sw.undo() == 3
+    out = capsys.readouterr().out
+    assert "SWAP=refused" in out and f"gbrainctl swap resume {SID}` is the only way on" in out
+    assert old.calls == [] and st["state"] == "failed"                 # nothing unfenced, the journal unchanged
+    assert "resume" in sw.next_hint("promote") and "undo`" not in sw.next_hint("promote").split("only")[0]
+    # control: before promote_started, undo with the target in recovery unfences the old primary
+    del st["promote_started"]
+    assert SW.Swap(SID, st, target, old, old, tmp_path).undo() == 0
+    assert old.calls[0][0] == "_unfence"
+
+
+class _FakeLocal:
+    def __init__(self, stack, role="standby", running=(), pg=None):
+        self.stack, self.host, self._role, self._running, self._pg = stack, {"name": "studio"}, role, set(running), pg
+
+    def role(self):
+        return self._role
+
+    def running(self, svc):
+        return svc in self._running
+
+    def ctr(self, svc):
+        if svc != "postgres" or self._pg is None:
+            return None
+        return {"name": "gbrain-pg", "state": self._pg[0], "running": self._pg[0] == "running"}
+
+    def psql(self, sql):
+        return (0, self._pg[1], "") if self._pg and self._pg[1] is not None else (1, "", "unreadable")
+
+
+def _fence(stack, sid=SID):
+    SW.write_fence(_FakeLocal(stack), {"swap_id": sid, "at": "x", "role_before": "none", "was_armed": True})
+
+
+def test_reseed_refuses_unless_this_host_is_the_fenced_old_primary(tmp_path, monkeypatch):
+    """F2: _reseed discards the local cluster. It refuses unless FENCE names THIS swap, ROLE=standby, no server/cron,
+    and postgres is not running as a primary: a host put back by hand is never reseeded, and nothing runs."""
+    ran = []
+    monkeypatch.setattr(SW, "run", lambda argv, **k: ran.append(argv) or subprocess.CompletedProcess(argv, 0, "", ""))
+    a = type("A", (), {"swap_id": SID})()
+    cases = [
+        (dict(), None, "FENCE names swap None"),                                            # hand restore removed it
+        (dict(), "20261120T000000Z-to-studio", "FENCE names swap 20261120T000000Z-to-studio"),   # old scrollback
+        (dict(role=None), SID, "ROLE=None"),                                                # ROLE removed by hand
+        (dict(running=("server",)), SID, "runs server"),
+        (dict(pg=("running", "f")), SID, "postgres runs and is not a replica (in_recovery=f)"),  # live primary
+        (dict(pg=("running", None)), SID, "in_recovery=unreadable"),
+    ]
+    for kw, fence_sid, want in cases:
+        (tmp_path / SW.FENCE_FILE).unlink(missing_ok=True)
+        if fence_sid:
+            _fence(tmp_path, fence_sid)
+        with pytest.raises(SW.StepFail, match=re.escape(want)):
+            SW.v_reseed(_FakeLocal(tmp_path, **kw), a)
+    assert ran == []                                                     # no seed started, no file touched
+    with pytest.raises(SW.StepFail, match="--swap-id"):
+        SW.v_reseed(_FakeLocal(tmp_path), type("A", (), {"swap_id": None})())
+    _fence(tmp_path)
+    assert SW.reseed_problems(_FakeLocal(tmp_path, pg=("exited", None)), SID) == []      # the fenced old primary
+    assert SW.reseed_problems(_FakeLocal(tmp_path, pg=("running", "t")), SID) == []      # a retry: a streaming copy
+
+
+def test_reseed_keeps_the_fence_until_seed_ok(tmp_path, monkeypatch):
+    """F2: FENCE goes only after SEED=ok, so a failed seed leaves a resume something to check."""
+    a = type("A", (), {"swap_id": SID})()
+    _fence(tmp_path)
+    monkeypatch.setattr(SW, "run", lambda argv, **k: subprocess.CompletedProcess(argv, 1, "SEED=fail step=x\n", ""))
+    with pytest.raises(SW.StepFail):
+        SW.v_reseed(_FakeLocal(tmp_path, pg=("exited", None)), a)
+    assert (tmp_path / SW.FENCE_FILE).exists()
+    monkeypatch.setattr(SW, "run", lambda argv, **k: subprocess.CompletedProcess(argv, 0, "SEED=ok host=studio\n", ""))
+    SW.v_reseed(_FakeLocal(tmp_path, pg=("exited", None)), a)
+    assert not (tmp_path / SW.FENCE_FILE).exists()
+
+
+def test_reseed_old_passes_the_swap_id(tmp_path):
+    old = _FakeSide("studio", {"_doctor": lambda args: {"eligible": True, "fresh": True, "primary_reachable": True,
+                                                        "last": "STANDBY=FRESH"}, "_reseed": {"seconds": 1}})
+    old.host = {"name": "studio"}
+    st = {"steps": {}, "no_reseed": True}
+    r = SW.Swap(SID, st, _FakeSide("nas-fleet", {}), old, old, tmp_path).s_reseed_old()
+    assert r["commands"][0].endswith(f"--swap-id {SID}")
+    st["no_reseed"] = False
+    old.answers["_doctor"] = (lambda it: (lambda args: next(it)))(iter(
+        [{"eligible": False, "last": "STALE"}, {"eligible": True, "fresh": True, "primary_reachable": True,
+                                                 "last": "FRESH"}]))
+    SW.Swap(SID, st, _FakeSide("nas-fleet", {}), old, old, tmp_path).s_reseed_old()
+    assert ("_reseed", ("--swap-id", SID)) in old.calls
+
+
+def _seed_mocks(monkeypatch, tmp_path, local_pg=None, src_in_recovery="f"):
+    CP = subprocess.CompletedProcess
+    calls = {"compose": [], "staged": 0}
+    (SB.sdir(tmp_path)).mkdir(parents=True)
+    (SB.sdir(tmp_path) / "repl_password").write_text("pw\n")
+    monkeypatch.setattr(SB, "container", lambda proj, svc: local_pg if svc == "postgres" else None)
+    monkeypatch.setattr(SB, "psql", lambda name, sql, *a, **k: (0, "f", ""))
+    monkeypatch.setattr(SB, "pg_image_of", lambda stack: "img")
+    monkeypatch.setattr(SB, "compose", lambda h, st, args, **k: calls["compose"].append(args) or CP(args, 0, "", ""))
+    monkeypatch.setattr(SB, "vsh", lambda img, vol, script, timeout=600: CP([], 0, "HAS\n", ""))
+    monkeypatch.setattr(SB.time, "sleep", lambda s: None)
+
+    def run(argv, **kw):
+        if "pg_is_in_recovery()" in argv[-1]:
+            return CP(argv, 0, src_in_recovery + "\n", "")
+        return CP(argv, 0, "1\n", "")
+    monkeypatch.setattr(SB, "run", run)
+    monkeypatch.setattr(SB, "reseed_staged", lambda *a: calls.__setitem__("staged", calls["staged"] + 1) or 0)
+    return calls
+
+
+def test_seed_refuses_over_a_running_primary(tmp_path, monkeypatch):
+    """F2: `standby seed --reseed` on a host whose postgres runs and is not a replica: refused before anything."""
+    calls = _seed_mocks(monkeypatch, tmp_path, local_pg={"name": "gbrain-pg", "status": "running"})
+    h = {"name": "studio", "compose_project": "gbrain", "pg_volume": "gbrain-pgdata"}
+    with pytest.raises(SystemExit) as e:
+        SB.cmd_seed(h, {"slot": "s", "repl_role": "r", "application_name": "a"}, tmp_path, True)
+    assert e.value.code == 3 and calls["compose"] == [] and calls["staged"] == 0
+    # a restart-looping guarded container (exit 78) is not a running postgres
+    monkeypatch.setattr(SB, "container", lambda proj, svc: {"name": "gbrain-pg", "status": "restarting"}
+                        if svc == "postgres" else None)
+    assert SB.local_primary_problem(h) is None
+
+
+def test_reseed_refuses_a_source_that_is_not_a_primary(tmp_path, monkeypatch):
+    """F2: the copy that replaces this cluster must come from a promoted primary (the target), not a replica."""
+    calls = _seed_mocks(monkeypatch, tmp_path, src_in_recovery="t")
+    h = {"name": "studio", "compose_project": "gbrain", "pg_volume": "gbrain-pgdata"}
+    sb = {"slot": "s", "repl_role": "r", "application_name": "a"}
+    with pytest.raises(SystemExit) as e:
+        SB.cmd_seed(h, sb, tmp_path, True)
+    assert e.value.code == 3 and calls["staged"] == 0
+    monkeypatch.setattr(SB, "run", lambda argv, **kw: subprocess.CompletedProcess(
+        argv, 0, ("f" if "pg_is_in_recovery()" in argv[-1] else "1") + "\n", ""))
+    rec = {"n": 0}
+    monkeypatch.setattr(SB, "reseed_staged", lambda *a: rec.__setitem__("n", 1) or 1)
+    assert SB.cmd_seed(h, sb, tmp_path, True) == 1 and rec["n"] == 1          # a primary source: the reseed runs
+
+
+def test_one_seed_at_a_time(tmp_path, monkeypatch):
+    """F6: a resumed reseed beside one still running (the killed coordinator's remote seed) is refused."""
+    import fcntl
+    calls = _seed_mocks(monkeypatch, tmp_path)
+    with open(tmp_path / ".seed.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        with pytest.raises(SystemExit) as e:
+            SB.cmd_seed({"name": "studio", "compose_project": "gbrain", "pg_volume": "v"}, {"slot": "s"}, tmp_path, True)
+    assert e.value.code == 3 and calls["compose"] == []
+
+
+def test_verifier_travels_on_stdin_and_is_scrubbed(tmp_path, monkeypatch):
+    """F5: the SCRAM verifier is never in argv (ps) and never in a journaled error."""
+    ver = "SCRAM-SHA-256$4096:UuZQqUjx4Zvag3MGQuqy0A==$ZZz7n5MTYQ=:t5ChLYQguMOx1FtgYHTXmlI="
+    old = _FakeSide("studio", {"_inputs": {"key_line": "k", "verifier": ver, "role": "r", "slot": "s", "mark": "s"},
+                               "_link_up": {"serve_port": 8199}})
+    target = _FakeSide("nas-fleet", {"_primary_enable": {"tail": ["APPLY=ok"]}})
+    SW.Swap(SID, {"steps": {}}, target, old, old, tmp_path).s_flip()
+    verb, args, stdin = target.calls[0]
+    assert verb == "_primary_enable" and ver not in " ".join(args) and stdin == ver + "\n"
+    assert ver not in SW.scrub(f"ERROR: x CONTEXT: create role r password '{ver}'") and "<redacted>" in SW.scrub(ver)
+    r = subprocess.run([sys.executable, str(STACK / "gbrainctl"), "swap", "_primary_enable", "--verifier", ver],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "unrecognized arguments" in r.stderr                  # argv is not accepted at all
+
+
+def test_compose_refuses_a_fenced_host_without_its_guard(tmp_path, monkeypatch):
+    """F3: a cleanup that drops ROLE (untracked) must not let `gbrainctl up` start the fenced old cluster writable."""
+    studio = host("studio")
+    (tmp_path / "FENCE").write_text(json.dumps({"swap_id": SID}))
+    assert "says a swap fenced this host, but ROLE=None" in G.fence_guard_problem(studio, tmp_path)
+    (tmp_path / "ROLE").write_text("standby\n")
+    assert G.fence_guard_problem(studio, tmp_path) is None                 # still fenced, still composed guarded
+    for f in ("FENCE", "ROLE"):
+        (tmp_path / f).unlink()                                            # `git clean -fdx`: both files gone
+    CP = subprocess.CompletedProcess
+    guarded = json.dumps(["if [ ! -f /var/lib/postgresql/data/standby.signal ]; then exit 78; fi"])
+    monkeypatch.setattr(G.subprocess, "run", lambda argv, **k: CP(argv, 0, "abc\n" if "ps" in argv else guarded, ""))
+    assert "standby-guarded" in G.fence_guard_problem(studio, tmp_path)   # docker still says fenced
+    monkeypatch.setattr(G.subprocess, "run", lambda argv, **k: CP(argv, 0, "abc\n" if "ps" in argv else '["postgres"]', ""))
+    assert G.fence_guard_problem(studio, tmp_path) is None                 # a plain primary composes as before
+    assert G.fence_guard_problem(host("nas-fleet"), tmp_path) is None       # the overlay is in the set: no docker read
+
+
+def test_rollback_refuses_a_swapped_host(tmp_path):
+    (tmp_path / "ROLE").write_text("standby\n")
+    r = subprocess.run([sys.executable, str(STACK / "gbrain-rollback"), "--host-file",
+                        str(STACK / "standby" / "drill" / "drill-a.toml"), "--stack-dir", str(tmp_path), "--drill"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "a standby swap changed this host" in r.stderr

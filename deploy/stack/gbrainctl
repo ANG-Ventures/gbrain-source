@@ -313,6 +313,31 @@ def compose_files(h: dict, stack: Path) -> list[str]:
     return files
 
 
+FENCE_FILE = "FENCE"
+
+
+def fence_guard_problem(h: dict, stack: Path) -> str | None:
+    """Why a changing compose command must not run here: a swap fenced this host (FENCE) but ROLE no longer says
+    standby, or this host's postgres container is the standby-guarded one (exit 78 without standby.signal) while the
+    files about to be composed lack the guard. The second reads docker, not the checkout: a cleanup that drops the
+    untracked ROLE/FENCE files cannot make an `up` start a fenced old primary read-write (read F3)."""
+    role = read_role(stack)
+    if (stack / FENCE_FILE).exists() and role != "standby":
+        return f"{stack / FENCE_FILE} says a swap fenced this host, but ROLE={role!r} (want standby)"
+    if STANDBY_OVERLAY in compose_files(h, stack):
+        return None
+    r = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={h['compose_project']}",
+                        "--filter", "label=com.docker.compose.service=postgres"], capture_output=True, text=True)
+    if r.returncode:
+        return f"docker ps rc={r.returncode}: cannot prove this host's postgres is not the fenced one"
+    for cid in r.stdout.split():
+        i = subprocess.run(["docker", "inspect", "-f", "{{json .Config.Cmd}}", cid], capture_output=True, text=True)
+        if i.returncode or ("standby.signal" in i.stdout and "exit 78" in i.stdout):
+            return (f"postgres container {cid} is the standby-guarded one (a fenced old primary or a standby) but "
+                    f"ROLE={role!r} composes without {STANDBY_OVERLAY}: it would start the old cluster read-write")
+    return None
+
+
 def compose_argv(h: dict, stack: Path) -> list[str]:
     argv = ["docker", "compose", "--project-directory", str(stack), "-p", h["compose_project"],
             "--env-file", str(stack / ".env")]
@@ -359,6 +384,11 @@ def run_compose(h: dict, stack: Path, args: list[str], capture=False):
         # the project (-p) comes from the host file, the .env from the stack dir: a mismatch runs one host's project
         # on another host's .env (prod's container names, volume and secrets) past the --allow-prod check
         die(f"refusing compose for host {h['name']!r}: {env_file} was rendered for host {m.group(3)!r}", 3)
+    if args and args[0] not in READ_ONLY_COMPOSE:
+        bad = fence_guard_problem(h, stack)
+        if bad:
+            die(f"refusing `compose {args[0]}`: {bad}. Finish the swap (`gbrainctl swap resume <id>`), or follow "
+                f"STANDBY.md \"Promoted but not serving\"", 3)
     return subprocess.run(compose_argv(h, stack) + args, env=clean_env(), capture_output=capture, text=capture)
 
 
