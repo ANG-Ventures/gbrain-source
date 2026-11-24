@@ -221,6 +221,24 @@ def test_c2_waits_through_sigtermed_before_judging(monkeypatch, capsys):
     assert "STOPPED: C2 readback not ok: ai.gbrain.serve=SIGTERMed/disabled" in capsys.readouterr().out
 
 
+def test_c8_waits_for_rerank_primary_before_judging(monkeypatch, capsys):
+    # C8 read rerank /health once, right after C7; primary_ok turns true only once the rerank-tunnel container's ssh
+    # is up (operator read 11-23): no answer, then primary_ok false, then true
+    reads = iter([None, None, {"primary_ok": False}, {"primary_ok": False}, {"primary_ok": True}])
+    monkeypatch.setattr(W, "http_json", lambda port, path="/health", timeout=3: next(reads, {"primary_ok": True}))
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    c8 = {s.sid: s for s in cutover.steps(_host(), drill=False)}["C8"]
+    assert W.Window("t", apply=True, drill=False).run_steps([c8]) == 0, capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "'primary_ok': True" in out and "STOPPED" not in out
+    # a primary that never comes up still stops C8 once the 60 s wait is over
+    monkeypatch.setattr(W, "http_json", lambda port, path="/health", timeout=3: {"primary_ok": False})
+    clock = iter(range(0, 10_000, 5))
+    monkeypatch.setattr(W.time, "monotonic", lambda: next(clock))
+    assert W.Window("t", apply=True, drill=False).run_steps([c8]) == 1
+    assert "STOPPED: C8 readback not ok: rerank" in capsys.readouterr().out
+
+
 # The REAL detached-run.py: ~/.hermes/scripts/detached-run.py on the Studio; GBRAIN_TEST_DETACHED_RUN points at a
 # hermes-home checkout's copy elsewhere. It has no dry/no-queue enqueue mode (--dry-run is only for
 # --resume-after-boot), so the test runs the full enqueue with DETACHED_RUN_HOME at a temp dir: every gate runs and the
