@@ -228,7 +228,10 @@ def steps(h: dict, drill: bool) -> list[Step]:
              readback=lambda: W.serve_health(h), expect='{"status":"ok","engine":"postgres"}', downtime_end=True),
         Step("C7", "gbrainctl status: every container at the pin", readback=status_ok, expect="STATUS=ok",
              readonly=False),
-        Step("C8", "rerank-proxy health", readback=rerank_ok, expect="primary_ok true"),
+        # primary_ok needs the rerank-tunnel container's ssh connected, which can lag C6/C7 by a few seconds (operator
+        # read 11-23, same one-shot readback as C2): wait up to 60 s before the readback judges it
+        Step("C8", "rerank-proxy health", run=lambda: W.wait_for(rerank_ok, 60, every=1),
+             readback=rerank_ok, expect="primary_ok true"),
         Step("C9", "warm path answers (rail.sh, what mem0 prefetch uses)", readback=rail_ok, expect="rc=0, hits",
              prod_only=True),
         Step("C10", "carry the launchd job's nightly stamp into the cron container's state",
