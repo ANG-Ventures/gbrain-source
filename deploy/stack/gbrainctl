@@ -283,10 +283,36 @@ def cmd_render(a) -> int:
     return 0
 
 
+STANDBY_OVERLAY = "docker-compose.standby.yaml"
+ROLE_FILE = "ROLE"
+
+
+def read_role(stack: Path) -> str | None:
+    """<stack>/ROLE (primary | standby), written only by `gbrainctl swap` (t_dd1e1edb). None = never swapped."""
+    try:
+        r = (stack / ROLE_FILE).read_text().strip()
+    except FileNotFoundError:
+        return None
+    return r if r in ("primary", "standby") else None
+
+
+def compose_files(h: dict, stack: Path) -> list[str]:
+    """The host profile's compose_files, with the standby overlay added or dropped by <stack>/ROLE: a host the swap
+    promoted composes WITHOUT it, a host it demoted composes WITH it (also the Studio, whose profile does not list
+    it). No ROLE file = the profile exactly, so a host that was never swapped composes as before."""
+    files = list(h.get("compose_files") or [])
+    role = read_role(stack)
+    if role == "primary":
+        files = [f for f in files if f != STANDBY_OVERLAY]
+    elif role == "standby" and STANDBY_OVERLAY not in files:
+        files.append(STANDBY_OVERLAY)
+    return files
+
+
 def compose_argv(h: dict, stack: Path) -> list[str]:
     argv = ["docker", "compose", "--project-directory", str(stack), "-p", h["compose_project"],
             "--env-file", str(stack / ".env")]
-    for f in h.get("compose_files") or []:
+    for f in compose_files(h, stack):
         argv += ["-f", str(stack / f)]
     return argv
 
@@ -414,6 +440,11 @@ def cmd_status(a) -> int:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("standby", "swap"):
+        # the warm standby and the swap (t_dd1e1edb, STANDBY.md): own modules beside this file, own argument parsers
+        sys.path.insert(0, str(STACK_REPO))
+        import importlib
+        return importlib.import_module(f"gbrain_{argv[0]}").main(argv[1:])
     rest: list[str] = []
     if "--" in argv:
         i = argv.index("--")

@@ -1,0 +1,31 @@
+# deploy/stack/docker-compose.nas-fleet.yaml: the nas-fleet overlay (card t_dd1e1edb). nas-fleet = the Ubuntu 24.04
+# LXC on the TrueNAS box (Ryzen 9 7950X, 32 threads, 124 GB). amd64 images; a cpu and memory limit on every service,
+# sized like the Studio's (docker-compose.studio.yaml) so a promotion runs gbrain the way the Studio does:
+#   postgres  4.0 / 14g / shm 8g: the replica replays what the Studio writes, and its postgresql.auto.conf came with
+#             the base backup (shared_buffers 6GB, the Studio's tuning); 2 more cores than the Studio's cap because
+#             this box has them and the cap throttled gbrain-pg 1,313 s in 48 h on the Studio (t_0ac711cc).
+#   server    4.0 / 4g, rerank-* 0.5 / 256m and 0.25 / 64m, cron 2.0 / 4g: the Studio's values.
+#   primary-link: its 0.25 / 64m cap is in the standby overlay itself (the same on every host).
+# Nothing here is host-network or published on the LAN: every port stays on 127.0.0.1 (the base file).
+services:
+  postgres:
+    platform: linux/amd64
+    cpus: 4.0
+    mem_limit: 14g
+    shm_size: 8g
+  server:
+    platform: linux/amd64
+    cpus: 4.0
+    mem_limit: 4g
+  rerank-proxy:
+    platform: linux/amd64
+    cpus: 0.5
+    mem_limit: 256m
+  rerank-tunnel:
+    platform: linux/amd64
+    cpus: 0.25
+    mem_limit: 64m
+  cron:
+    platform: linux/amd64
+    cpus: 2.0
+    mem_limit: 4g
