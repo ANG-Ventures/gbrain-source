@@ -126,7 +126,7 @@ checkpoint_lsn`, `promote ... pg_in_recovery=False`, `start ... health_ok=True c
 ELIGIBLE=yes`, last `SWAP=ok id=<id> to=nas-fleet from=studio steps=8/8 seconds=<s>`.
 
 Caller-visible cost (drill, 11-24, under a search every 0.5 s through the callers' port and a write every 0.5 s): see
-"Drill" below. Budget ~20 s of failed searches per direction and ~10 min for step 8 (a 30 GB staged reseed + verify).
+"Drill" below. Budget ~30 s of failed searches per direction and ~10 min for step 8 (a 30 GB staged reseed + verify).
 Until step 8 finishes there is NO standby; say so in every report.
 
 Swap back: `python3.14 ./gbrainctl swap --to studio --dry-run`, then without `--dry-run` (the Studio follows nas-fleet
@@ -148,28 +148,33 @@ container sharing gbrain-pg's network namespace, `-X stream -r 100M`, its own te
 the Studio, streamed to the NAS and the volume removed: 322 s backup + 469 s transfer, 49,043 pages). Real images
 (amd64 at 7969d968), real 1P render, real rerank tunnel to ACE-AI; the drill cron is never armed and has no NAS key.
 
-Measured 2026-11-24 15:10-15:43Z (`drill.sh setup`, `run`, then an undo arm; journals and logs were read before
-`teardown`):
+Re-drilled at 6b0f046f (after the Prism rounds 2-3 fixes: promote re-fence and resume marker, fence recreates the
+stopped postgres container under the standby guard, two-phase reseed restore with a checked stop, atomic pg_hba /
+authorized_keys rewrites) on a fresh copy, 2026-11-24 17:06-17:41Z (`drill.sh setup`, `run`, then a fence-guard arm;
+the log was read before `teardown`). The copy: `pg_basebackup` 371 s, staged and rsynced to the NAS in 134 s,
+`pg_verifybackup` VERIFIED.
 
 | what | result |
 |---|---|
-| render + init, both halves | `RENDER=ok keys=26 files=10` each (1P read-only token on nas-fleet), `INIT=ok` |
-| A up on the copy | postgres up and answering in 7 s, 49,043 pages; full stack `/health` engine=postgres 5 s later |
-| primary-enable (A accepts B) | `role gbrain_repl_drill_b login=true repl=true`, `hba_loaded 1`, `hba_errors 0`, `key_line present`, `APPLY=ok` |
-| `standby seed` of B, 30 GB through the ssh link | `basebackup rc=0 seconds=309`, `SEED=ok`, 312 s end to end |
-| B's doctor after the seed | `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`, server + cron created at revision 7969d968 == pin, `rerank primary_ok=True` (the GPU host reached from nas-fleet) |
-| swap 1, A -> B (`SWAP=ok steps=8/8`, 676 s) | preflight 0.7 s, fence 4.6 s (`pg_state=shut down`), catchup 0.2 s (replay 7D/A085700 >= checkpoint 7D/A085688), promote 5.2 s, start 4.4 s (`cron_count=1 old_cron_running=0`), flip 4.5 s, prove 57.0 s (the first search on a cold server: 56.8 s, 1 hit), reseed_old 599 s (`STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`) |
-| callers during swap 1 | searches every 0.5 s through A's loopback serve port: 1,302, 35 failed, longest failure window **17.5 s**; writes every 0.5 s: 1,385, 7 failed, longest window 3.5 s; **acked writes 1,378 / 1,378 present on the new primary** |
-| swap 2, B -> A, the swap back (`SWAP=ok steps=8/8`, 542 s) | fence 6.0 s, catchup 0.2 s, promote 4.5 s, start 4.3 s, flip 4.9 s, prove 17.1 s, reseed_old 505 s |
-| callers during swap 2 | searches 1,074, 28 failed, longest window **33.6 s** (the fence to the first answer from A's freshly started server: its first searches ran past the 20 s client timeout); writes 1,126, 10 failed, longest 5.0 s; **acked writes 1,116 / 1,116 present** |
-| after each swap | the new standby's doctor `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`; both serve ports answer engine=postgres and a search (warm: 223-299 ms) |
-| undo arm: swap A -> B with an injected failure at promote, then `swap undo` | `SWAP=failed ... step=promote` (preflight, fence, catchup done); `SWAP=undone primary=drill-a` in 15 s (fence to serving again: 20 s); B stayed a FRESH, ELIGIBLE replica; a second `undo` is a no-op `SWAP=undone` |
+| render + init, A up on the copy | `INIT=ok` both halves; A's full stack `/health` engine=postgres 5 s after postgres |
+| primary-enable (A accepts B) | `hba_loaded 1`, `hba_errors 0`, `key_line present`, `APPLY=ok` |
+| `standby seed` of B, 30 GB through the ssh link | `basebackup rc=0 seconds=313`, `SEED=ok`, setup 340 s end to end |
+| B's doctor after the seed | `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes` |
+| swap 1, A -> B (`SWAP=ok steps=8/8`, 628 s) | preflight 0.6 s, fence 5.6 s, catchup 0.2 s, promote 9.9 s (re-fence + target status + promote), start 11.2 s, flip 4.7 s, prove 16.8 s, reseed_old 578.9 s |
+| callers during swap 1 | searches every 0.5 s: 1,190, 60 failed, longest failure window **30.0 s**; writes every 0.5 s: 1,264, 21 failed, longest **7.5 s**; **acked writes 1,243 / 1,243 present on the new primary** |
+| swap 2, B -> A (`SWAP=ok steps=8/8`, 547 s) | fence 4.7 s, catchup 0.2 s, promote 15.6 s, start 10.8 s, flip 4.6 s, prove 8.1 s, reseed_old 502.7 s |
+| callers during swap 2 | searches 1,059, 60 failed, longest **30.0 s**; writes 1,109, 29 failed, longest **9.0 s**; **acked writes 1,080 / 1,080 present** |
+| after each swap | `DRILL=ok`: the new standby's doctor `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`; both serve ports answer engine=postgres and a search (282-479 ms) |
+| fence-guard arm: swap A -> B `--no-reseed`, then `gbrainctl compose -- restart postgres` on the fenced A | `SWAP=ok` 31 s; A's stopped container carries the guarded command; the restart leaves it `restarting exit=78` with `refused: no standby.signal` (never writable); `standby seed --reseed` of A from B: `SEED=ok` 511 s, `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes` |
+
+The first drill (055a281c, 15:10-15:43Z) also ran an undo arm: an injected failure at promote, then `swap undo`:
+`SWAP=undone primary=drill-a` in 15 s. Its swap windows were 17.5 s / 33.6 s (searches) and 3.5 s / 5.0 s (writes).
 
 What the numbers mean for production:
-- Callers lose ~20-35 s of searches per direction: fence -> start is ~15 s, and a freshly started server answers its
+- Callers lose ~20-35 s of searches per direction: fence -> start is ~20-30 s, and a freshly started server answers its
   first searches slowly (cold caches; 17-57 s for the first in the drill). The mem0 prefetch's gbrain leg times out to
   `[]` for those turns (it does not fail the turn); rail.sh fails for them.
-- Writes (the cron's imports, OAuth token rows) are refused for ~5 s and none that was acked is lost.
+- Writes (the cron's imports, OAuth token rows) are refused for ~5-10 s and none that was acked is lost.
 - reseed_old (a 30 GB staged copy + `pg_verifybackup` + the switch) is 8-10 minutes; there is no standby until it
   ends. The Studio's base backup is read at `basebackup_rate` (100 MB/s).
 - The production Studio side adds what the drill cannot: OrbStack, the Studio's 6 GB shared_buffers shutdown
