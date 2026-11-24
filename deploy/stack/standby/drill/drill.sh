@@ -135,6 +135,37 @@ probe() {
   done
 }
 
+one_swap() {  # half-to-promote new-primary-pg-container: callers + writers on, the swap, callers + writers off, summary
+  rm -f "$RIG/load.stop" "$RIG/load.jsonl"
+  python3 "$SRC/standby/drill/drill_load.py" "$RIG" 18291 gbrain-swapdrill-a-pg,gbrain-swapdrill-b-pg &
+  local lp=$! rc=0
+  sleep 10
+  say "swap --to-file drill-$1"
+  local t0=$SECONDS
+  ctl swap --to-file "$(prof "$1")" || rc=$?
+  echo "SWAP_WALL_S=$((SECONDS - t0)) rc=$rc"
+  sleep 10
+  touch "$RIG/load.stop"; wait "$lp" || true
+  python3 "$SRC/standby/drill/drill_load.py" summary "$RIG" "$2" || rc=1
+  return $rc
+}
+
+run() {  # the whole drill after setup: swap to B under load, swap back to A under load, the doctor of each standby
+  say "acked-write table on A (replicates)"
+  docker exec gbrain-swapdrill-a-pg psql -X -q -U gbrain -d gbrain -c \
+    "create table if not exists swapdrill_acks(id bigserial primary key, seq int, at timestamptz default now())"
+  sleep 3
+  ctl standby status --host-file "$B" | tail -1
+  one_swap b gbrain-swapdrill-b-pg
+  say "after swap 1: the new standby (A)"
+  ctl standby status --host-file "$A" || true
+  probe
+  one_swap a gbrain-swapdrill-a-pg
+  say "after swap 2: the standby (B)"
+  ctl standby status --host-file "$B" || true
+  probe
+}
+
 teardown() {
   for x in b a; do
     [[ -f $(prof $x) ]] && { cx "$(prof $x)" --profile promoted down --remove-orphans -t 30 >/dev/null 2>&1 || true; }
@@ -152,6 +183,7 @@ case ${1:-} in
   swap) h=$2; shift 2; ctl swap --to-file "$(prof "$h")" "$@" ;;
   ctl) shift; ctl "$@" ;;
   probe) probe ;;
+  run) run ;;
   teardown) teardown ;;
   *) sed -n '2,15p' "$0"; exit 2 ;;
 esac
