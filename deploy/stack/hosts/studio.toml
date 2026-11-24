@@ -60,6 +60,7 @@ lan_ip          = "192.168.1.18"
 
 [swap]
 ssh             = "alexgierczyk@192.168.1.18"
+python          = "/opt/homebrew/bin/python3.14"           # gbrainctl needs >= 3.11; the login python3 may be 3.9
 callers_host    = "studio"                                 # the mem0 prefetch, rail.sh and the MCP shim all live here
 prove_client_env = "~/gbrain/.gbrain/rail-cli.env"         # the OAuth client `swap` step prove searches as (rail-cli)
 
