@@ -255,6 +255,10 @@ f2() {  # half to promote (the one whose profile lists the standby overlay: b, t
   ctl standby seed --reseed --host-file "$(prof "$h")" | tail -3 || r5=$?
   echo "B5_RESEED_S=$((SECONDS - t0))"
   ctl standby status --host-file "$(prof "$h")" | tail -1 || r5=1
+  say "F2: B4, the journal closed (a new swap is allowed, this one can never be resumed)"
+  mv "$GBRAIN_SWAP_STATE/$sid" "$GBRAIN_SWAP_STATE/../state-closed-$sid"
+  ctl swap status | tail -1
+  ctl swap status | tail -1 | grep -q '^SWAP=status open=-$' || r5=1
   local ok=0; [[ $r1 == 1 && $r2 != 0 && $r3 != 0 && $a == "$b" && $r5 == 0 ]] && ok=1
   echo "F2=$([[ $ok == 1 ]] && echo ok || echo failed) resume_rc=$r1 bare_reseed_rc=$r2 no_id_reseed_rc=$r3" \
     "unchanged=$([[ $a == "$b" ]] && echo yes || echo NO) b5_rc=$r5"
