@@ -132,10 +132,58 @@ Until step 8 finishes there is NO standby; say so in every report.
 Swap back: `python3.14 ./gbrainctl swap --to studio --dry-run`, then without `--dry-run` (the Studio follows nas-fleet
 through `_mem0link`; step 8 reseeds nas-fleet through `_studiolink`, whose key line the first standby set up).
 
-Stop conditions (the mem0 rules): preflight refused = nothing changed. A step failing before `pg_promote`:
-`gbrainctl swap undo <id>` -> `SWAP=undone primary=studio` (the Studio's server and cron back, ARMED as it was). After
-promote: `gbrainctl swap resume <id>` only. Callers erroring for more than 120 s from the fence: stop and read the
-journal (`~/.local/state/gbrain-swap/<id>/journal.jsonl` on the box that ran it).
+Stop conditions (the mem0 rules): preflight refused = nothing changed. A step failing before the promotion starts
+(fence, catchup, or promote before `promote_started` is in `state.json`): `gbrainctl swap undo <id>` -> `SWAP=undone
+primary=studio` (the Studio's server and cron back, ARMED as it was). Once `promote_started` is journaled, undo refuses:
+the promotion may still finish on nas-fleet after the coordinator died or `pg_promote` answered late, and an unfenced
+Studio beside it would be a second primary. From there `gbrainctl swap resume <id>` only; when resume cannot finish,
+"Promoted but not serving" below. Callers erroring for more than 120 s from the fence: stop and read the journal
+(`~/.local/state/gbrain-swap/<id>/journal.jsonl` on the box that ran it).
+
+What keeps a demoted Studio from starting its old cluster read-write (until step 8 reseeds it): `ROLE=standby` adds the
+standby overlay, whose postgres exits 78 without `standby.signal`; the fence recreates the stopped container that way.
+`ROLE`, `FENCE` and the lock files are in `deploy/stack/.gitignore`, and `gbrainctl compose|up|down` refuses any
+changing command while `FENCE` exists without `ROLE=standby`, or while docker holds the guarded postgres container and
+the files to compose lack the overlay (so a `git clean -fdx` of the checkout still cannot start it). `swap _reseed`
+discards this host's cluster only for the swap whose `FENCE` it holds, with `ROLE=standby` and no postgres running as a
+primary; `standby seed --reseed` refuses over a running primary and from a source that is not one; one seed runs at a
+time per stack dir. `gbrain-rollback` refuses a host that holds `ROLE` or `FENCE`.
+
+### Promoted but not serving (after `promote_started`, resume cannot finish)
+
+The Studio is fenced (server, cron and postgres stopped, `ROLE=standby`, `FENCE`), nas-fleet is a primary, and
+127.0.0.1:8199 on the Studio does not answer (step start or flip failed: nas-fleet health never answers, no `sudo -n`
+on nas-fleet for primary-enable, the link does not come up). Callers are down until one of these ends. NAS =
+`ssh ace@192.168.1.154 'cd ~/gbrain-standby/deploy/stack && ...'`; Studio = `cd ~/gbrain-stack-live/deploy/stack`.
+
+A. Forward (first choice: nothing is lost).
+1. Read why: `gbrainctl swap status <id>` and the last `step_failed` line of the journal.
+2. start failed: NAS `python3 ./gbrainctl compose --host nas-fleet -- ps` and `-- logs --tail 100 server`; fix the
+   cause. Proof: NAS `curl -s 127.0.0.1:8199/health` reads `"engine":"postgres"`.
+3. flip failed on sudo: make `ssh ace@192.168.1.154 'sudo -n true'` exit 0 (STANDBY.md 2.3). Proof: that rc.
+4. `gbrainctl swap resume <id>` on the Studio. Proof: `step_done step=start|flip|prove`, last `SWAP=ok`.
+
+B. Back to the Studio by hand (owner decision: whatever nas-fleet took after promote is discarded; it took writes only
+if its server or cron ran, i.e. step start got that far).
+1. NAS, stop it serving and record what it holds:
+   `docker exec gbrain-pg psql -X -At -U gbrain -d postgres -c "select pg_current_wal_lsn(), timeline_id from
+   pg_control_checkpoint()"` (compare with the Studio's `fence.checkpoint_lsn` in `state.json`; a later LSN is what B
+   discards), then `python3 ./gbrainctl compose --host nas-fleet --allow-prod -- stop server cron postgres`.
+   Proof: `docker ps --filter label=com.docker.compose.project=gbrain --format '{{.Names}} {{.State}}'` shows server,
+   cron and gbrain-pg `exited`.
+2. NAS, keep it from starting as a primary again: `rm ROLE`, then
+   `python3 ./gbrainctl compose --host nas-fleet --allow-prod -- up --no-start --no-deps --force-recreate postgres`.
+   Proof: `docker inspect -f '{{json .Config.Cmd}}' gbrain-pg` contains `exit 78`.
+3. Studio, unfence (the host verb `undo` would have run; it removes the link, recreates postgres unguarded, re-arms the
+   cron as `FENCE` recorded, starts everything, then deletes `FENCE`):
+   `python3.14 ./gbrainctl swap _unfence --host studio --swap-id <id>`.
+   Proof: `SIDE={"ok": true, "pg_in_recovery": false, "health_ok": true, "cron_running": true, ...}`, then
+   `python3.14 ./gbrainctl swap _prove --host studio` -> `"hits": >= 1`.
+4. Close the journal so a new swap is allowed and the old one can never be resumed:
+   `mv ~/.local/state/gbrain-swap/<id> ~/.local/state/gbrain-swap-closed-<id>`. Proof: `gbrainctl swap status` ->
+   `SWAP=status open=-`.
+5. NAS back to a standby of the Studio: `python3 ./gbrainctl standby seed --reseed --host nas-fleet` (staged, ~10 min).
+   Proof: `SEED=ok`, then `standby status` -> `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`.
 
 After the swap back: resume both monitors, read their first ticks.
 

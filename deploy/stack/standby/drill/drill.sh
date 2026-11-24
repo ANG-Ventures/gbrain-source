@@ -11,6 +11,10 @@
 #   drill.sh swap <a|b> [args]  gbrainctl swap --to-file <that half> [args]   (GBRAIN_SWAP_STATE in the run dir)
 #   drill.sh ctl <args>         gbrainctl with the drill env, from home-a
 #   drill.sh probe              A's and B's loopback /health + one search through each half's serve port
+#   drill.sh f1 <a|b>           read F1: swap to that half, SIGKILL the coordinator once promote_started is journaled,
+#                               `swap undo` must refuse (old primary stays fenced), then `swap resume` must finish
+#   drill.sh f2 <a|b>           read F2: swap to that half with a failure injected at reseed_old, put the old primary
+#                               back by hand, then `swap resume` and a bare `_reseed` must refuse and delete nothing
 #   drill.sh teardown           both projects, their volumes, the rig, the data dir
 set -euo pipefail
 SRC=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)          # deploy/stack of the checkout this file is in
@@ -133,7 +137,8 @@ PY
 
   say "B: A accepts it (primary-enable through swap _inputs/_primary_enable), then standby seed"
   local inp; inp=$(ctl swap _inputs --host-file "$B" | sed -n 's/^SIDE=//p')
-  ctl swap _primary_enable --host-file "$A" --key-line "$(jq -r .key_line <<<"$inp")" --verifier "$(jq -r .verifier <<<"$inp")" \
+  # the verifier on stdin, never argv (read F5)
+  jq -r .verifier <<<"$inp" | ctl swap _primary_enable --host-file "$A" --key-line "$(jq -r .key_line <<<"$inp")" \
     --role "$(jq -r .role <<<"$inp")" --slot "$(jq -r .slot <<<"$inp")" --mark "$(jq -r .mark <<<"$inp")" \
     | sed -n 's/^SIDE=//p' | jq -c .tail
   t0=$SECONDS
@@ -185,6 +190,75 @@ run() {  # the whole drill after setup: swap to B under load, swap back to A und
   return $rc
 }
 
+other() { case $1 in a) echo b ;; b) echo a ;; esac; }
+newest_swap() { ls -1 "$GBRAIN_SWAP_STATE" 2>/dev/null | grep -v '^\.' | sort | tail -1; }
+in_recovery() { docker exec "gbrain-swapdrill-$1-pg" psql -X -At -U gbrain -d postgres -c 'select pg_is_in_recovery()' 2>&1 | tail -1; }
+
+f1() {  # half to promote
+  local h=$1 o; o=$(other "$1"); prof "$h" >/dev/null
+  local before; before=$(newest_swap)
+  say "F1 arm: swap --to-file drill-$h; the coordinator is SIGKILLed once promote_started is journaled"
+  # exec: $! must be the coordinator itself, not a subshell around it (its children, the side verbs, live on)
+  ( exec python3 "$RIG/home-a/deploy/stack/gbrainctl" swap --to-file "$(prof "$h")" > "$RIG/f1-swap.log" 2>&1 ) &
+  local cp=$! sid="" n
+  for n in $(seq 3000); do
+    sid=$(newest_swap)
+    [[ -n $sid && $sid != "$before" ]] && grep -q '"promote_started"' "$GBRAIN_SWAP_STATE/$sid/state.json" 2>/dev/null && break
+    sid=""; sleep 0.2
+  done
+  [[ -n $sid ]] || { kill "$cp"; echo "F1: promote_started never journaled" >&2; return 1; }
+  kill -9 "$cp"; wait "$cp" 2>/dev/null || true
+  echo "F1 coordinator pid=$cp SIGKILLed; swap=$sid; target $h in_recovery=$(in_recovery "$h") (the remote _promote runs on)"
+  local urc=0; ctl swap undo "$sid" || urc=$?
+  echo "F1_UNDO_RC=$urc old $o: ROLE=$(cat "$RIG/home-$o/deploy/stack/ROLE" 2>/dev/null) fence=$(jq -r .swap_id \
+    "$RIG/home-$o/deploy/stack/FENCE" 2>/dev/null) postgres=$(docker inspect -f '{{.State.Status}}' "gbrain-swapdrill-$o-pg")"
+  sleep 20
+  echo "F1 target $h in_recovery=$(in_recovery "$h") 20 s later"
+  local rrc=0; ctl swap resume "$sid" | tail -4 || rrc=$?
+  ctl standby status --host-file "$(prof "$o")" | tail -1 || rrc=1
+  echo "F1=$([[ $urc == 3 && $rrc == 0 ]] && echo ok || echo failed) undo_rc=$urc resume_rc=$rrc"
+  [[ $urc == 3 && $rrc == 0 ]]
+}
+
+f2() {  # half to promote (the one whose profile lists the standby overlay: b, the nas-fleet stand-in)
+  local h=$1 o; o=$(other "$1"); prof "$h" >/dev/null
+  local os="$RIG/home-$o/deploy/stack" hs="$RIG/home-$h/deploy/stack" pg="gbrain-swapdrill-$o-pg" sid rc=0
+  say "F2 arm: swap --to-file drill-$h with a failure injected at reseed_old"
+  GBRAIN_SWAP_INJECT_FAIL=reseed_old ctl swap --to-file "$(prof "$h")" | tail -3 || rc=$?
+  sid=$(newest_swap); echo "F2 swap=$sid rc=$rc (want 1 at reseed_old)"
+  say "F2: $o back as the primary by hand, STANDBY.md \"Promoted but not serving\" B1-B3"
+  cx "$(prof "$h")" stop server cron postgres                                                       # B1
+  docker ps -a --filter "label=com.docker.compose.project=gbrain-swapdrill-$h" --format '{{.Names}} {{.State}}' \
+    | sed 's/^/B1 /'
+  rm -f "$hs/ROLE"; cx "$(prof "$h")" up --no-start --no-deps --force-recreate postgres 2>&1 | tail -1    # B2
+  echo "B2 $h postgres guarded: $(docker inspect -f '{{json .Config.Cmd}}' "gbrain-swapdrill-$h-pg" | grep -c 'exit 78')"
+  ctl swap _unfence --host-file "$(prof "$o")" --swap-id "$sid" | sed -n 's/^SIDE=//p' \
+    | jq -c '{ok,pg_in_recovery,health_ok,cron_running,role,error}'                                # B3
+  ctl swap _prove --host-file "$(prof "$o")" | sed -n 's/^SIDE=//p' | jq -c '{ok,hits,search_ms}'
+  docker exec "$pg" psql -X -q -U gbrain -d gbrain -c "insert into swapdrill_acks(seq) values (-4242)"
+  snap() { echo "in_recovery=$(in_recovery "$o") pages=$(docker exec "$pg" psql -X -At -U gbrain -d gbrain \
+    -c 'select count(*) from pages') marker=$(docker exec "$pg" psql -X -At -U gbrain -d gbrain \
+    -c 'select count(*) from swapdrill_acks where seq = -4242') datadir=$(sudo -n ls -A "$DATA/$o/pg" | sort \
+    | tr '\n' ',' | md5sum | cut -c1-12) ROLE=$(cat "$os/ROLE" 2>/dev/null || echo -) FENCE=$(test -e "$os/FENCE" \
+    && echo yes || echo -)"; }
+  local b; b=$(snap); echo "F2 before: $b"
+  local r1=0 r2=0 r3=0
+  say "F2: swap resume (journal says reseed_old is next) and the bare _reseed, with and without the swap id"
+  ctl swap resume "$sid" | tail -3 || r1=$?
+  ctl swap _reseed --host-file "$(prof "$o")" --swap-id "$sid" | sed -n 's/^SIDE=//p' | jq -c '{ok,error}' || r2=$?
+  ctl swap _reseed --host-file "$(prof "$o")" 2>&1 | sed -n 's/^SIDE=//p' | jq -c '{ok,error}' || r3=$?
+  local a; a=$(snap); echo "F2 after:  $a"
+  say "F2: B5, $h back to a standby of $o"
+  local t0=$SECONDS r5=0
+  ctl standby seed --reseed --host-file "$(prof "$h")" | tail -3 || r5=$?
+  echo "B5_RESEED_S=$((SECONDS - t0))"
+  ctl standby status --host-file "$(prof "$h")" | tail -1 || r5=1
+  local ok=0; [[ $r1 == 1 && $r2 != 0 && $r3 != 0 && $a == "$b" && $r5 == 0 ]] && ok=1
+  echo "F2=$([[ $ok == 1 ]] && echo ok || echo failed) resume_rc=$r1 bare_reseed_rc=$r2 no_id_reseed_rc=$r3" \
+    "unchanged=$([[ $a == "$b" ]] && echo yes || echo NO) b5_rc=$r5"
+  [[ $ok == 1 ]]
+}
+
 teardown() {
   # by compose label, not `gbrainctl compose -- down`: gbrainctl refuses a leading global flag (--profile), so the
   # promoted-profile server/cron would be left behind; containers go first, then volumes, then the data
@@ -215,6 +289,8 @@ case ${1:-} in
   ctl) shift; ctl "$@" ;;
   probe) probe ;;
   run) run ;;
+  f1) f1 "${2:?half}" ;;
+  f2) f2 "${2:?half}" ;;
   teardown) teardown ;;
   *) sed -n '2,15p' "$0"; exit 2 ;;
 esac
