@@ -40,6 +40,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import importlib.machinery
 import importlib.util
 import json
@@ -47,11 +48,10 @@ import os
 import re
 import secrets
 import subprocess
+import stat
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -176,7 +176,7 @@ def run(argv, **kw) -> subprocess.CompletedProcess:
 def cmd_init(host: dict, sb: dict, stack: Path) -> int:
     d = sdir(stack)
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(d, 0o700)
+    os.chmod(d, stat.S_IRWXU)   # owner only: it holds the link key and the replication password
     key = d / "link_key"
     if not key.exists():
         r = run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"gbrain-standby@{host['name']}", "-f", str(key)])
@@ -316,11 +316,26 @@ def fnum(s) -> float | None:
         return None
 
 
-def http_json(url: str, timeout: float = 5) -> dict | None:
+def loopback(port: int, method: str, path: str, body: bytes | None = None, headers: dict | None = None,
+             timeout: float = 5) -> tuple[int, str]:
+    """One HTTP request to 127.0.0.1:<port><path>. Loopback only: the scheme and host are fixed here, callers pass a
+    port and a path (the window_lib.http_json shape; semgrep dynamic-urllib-use). Raises OSError on no answer."""
+    if not path.startswith("/"):
+        raise ValueError(f"path must start with /: {path!r}")
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as r:
-            return json.loads(r.read().decode() or "{}")
-    except (urllib.error.URLError, OSError, ValueError):
+        conn.request(method, path, body=body, headers=headers or {})
+        r = conn.getresponse()
+        return r.status, r.read().decode()
+    finally:
+        conn.close()
+
+
+def http_json(port: int, path: str = "/health", timeout: float = 5) -> dict | None:
+    try:
+        status, text = loopback(port, "GET", path, timeout=timeout)
+        return json.loads(text or "{}") if status < 400 else None
+    except (OSError, ValueError, http.client.HTTPException):
         return None
 
 
@@ -396,7 +411,7 @@ def observe(host: dict, sb: dict, stack: Path) -> dict:
     rp = cs["rerank-proxy"]
     o["rerank"] = None
     if rp and rp["running"]:
-        o["rerank"] = http_json(f"http://127.0.0.1:{host['ports']['rerank']}/health") or {"error": "no answer"}
+        o["rerank"] = http_json(host['ports']['rerank'], "/health") or {"error": "no answer"}
     return o
 
 
@@ -618,15 +633,28 @@ def reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf) -> int:
     if "VERIFIED" not in vf.stdout:
         return abort("verify", "the new copy did not verify")
 
+    def stopped() -> bool:
+        # no file under PGDATA moves while a postmaster may hold it: the stop must succeed AND the container must
+        # read not running (Prism b690e265cecb)
+        r = compose(host, stack, ["stop", "postgres"], timeout=300)
+        ps = run(["docker", "ps", "-q", "--filter", f"label=com.docker.compose.project={host['compose_project']}",
+                  "--filter", "label=com.docker.compose.service=postgres", "--filter", "status=running"])
+        return r.returncode == 0 and ps.returncode == 0 and not ps.stdout.strip()
+
     def restore(step, why):
-        compose(host, stack, ["stop", "postgres"], timeout=300)
+        if not stopped():
+            print(f"SEED=fail host={name} step={step}: {why}; postgres did not stop, so nothing was moved back: "
+                  f"both copies are kept ({OLD} and the live dir); stop it and inspect by hand")
+            return 1
         b = vsh(pg_image, vol, restore_script(), timeout=3600)
         drop_next()
         print(f"SEED=fail host={name} step={step}: {why}; "
               + ("the old cluster is back (stopped)" if "RESTORED" in b.stdout else f"RESTORE FAILED: it is in {OLD}"))
         return 1
 
-    compose(host, stack, ["stop", "postgres"], timeout=300)
+    if not stopped():
+        compose(host, stack, ["up", "-d", "--no-deps", "postgres"], timeout=600)
+        return abort("stop", "postgres did not stop; nothing was moved")
     sw = vsh(pg_image, vol, switch_script(), timeout=3600)
     if "SWITCHED" not in sw.stdout:
         return restore("switch", f"moving the new copy up failed: {sw.stderr.strip()[-200:]}")

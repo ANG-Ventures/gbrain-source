@@ -333,14 +333,35 @@ def test_promote_reproves_catchup_against_the_current_fence_checkpoint(tmp_path)
         "_fence": {"checkpoint_lsn": "7E/100", "was_armed": True},
         "_status": {"containers": {}, "role_file": "standby", "fence": {"swap_id": sid}}})
     target = _FakeSide("nas-fleet", {
+        "_status": {"pg": {"in_recovery": True}},
         "_catchup": lambda args: {"replay_lsn": args[1], "checkpoint_lsn": args[1]},
         "_promote": {"pg_in_recovery": False}})
     st = {"steps": {"fence": {}, "catchup": {}}, "fence": {"checkpoint_lsn": "7D/5BEC278", "was_armed": True}}
     sw = SW.Swap(sid, st, target, old, old, tmp_path)
     r = sw.s_promote()
-    assert [c[0] for c in target.calls] == ["_catchup", "_promote"]
-    assert target.calls[0][1][:2] == ("--checkpoint-lsn", "7E/100")      # the re-fenced checkpoint, not the saved one
+    assert [c[0] for c in target.calls] == ["_status", "_catchup", "_promote"]
+    assert target.calls[1][1][:2] == ("--checkpoint-lsn", "7E/100")      # the re-fenced checkpoint, not the saved one
     assert sw.st["fence"]["checkpoint_lsn"] == "7E/100" and r["checkpoint_lsn"] == "7E/100"
+    assert sw.st["promote_started"]
+
+
+def test_promote_resume_after_an_unjournaled_promotion(tmp_path):
+    sid = "20261124T160000Z-to-nas-fleet"
+    old = _FakeSide("studio", {
+        "_fence": {"checkpoint_lsn": "7E/100", "was_armed": True},
+        "_status": {"containers": {}, "role_file": "standby", "fence": {"swap_id": sid}}})
+    target = _FakeSide("nas-fleet", {"_status": {"pg": {"in_recovery": False}},
+                                     "_promote": {"pg_in_recovery": False}})
+    st = {"steps": {"fence": {}, "catchup": {}}, "fence": {"checkpoint_lsn": "7E/100", "was_armed": True},
+          "promote_started": "2026-11-24T16:20:00Z"}
+    r = SW.Swap(sid, st, target, old, old, tmp_path).s_promote()
+    assert [c[0] for c in target.calls] == ["_status", "_promote"] and r["resumed_after_promote"]
+    # the same primary target with no promote_started marker: this swap did not promote it, refuse
+    target.calls.clear()
+    del st["promote_started"]
+    with pytest.raises(SW.StepFail, match="never started its promotion"):
+        SW.Swap(sid, st, target, old, old, tmp_path).s_promote()
+    assert [c[0] for c in target.calls] == ["_status"]
 
 
 def test_drill_load_counts_hits_and_refuses_an_empty_summary(tmp_path):
@@ -357,3 +378,32 @@ def test_primary_enable_replaces_tagged_lines_and_drops_any_slot():
     assert 'if [[ $cur != "$HBA" ]]; then' in t and 'if [[ $have != "$want" ]]; then' in t
     assert "address='$gw' and netmask='255.255.255.255'" in t
     assert "where slot_name = '$slot' and not active" not in t
+
+
+def test_reseed_moves_no_file_while_postgres_still_runs(monkeypatch):
+    """Prism b690e265cecb: `compose stop postgres` failing (or postgres still running) stops the reseed before the
+    switch, and a restore after a failed start never moves files back under a live postmaster."""
+    import types
+    CP = subprocess.CompletedProcess
+    scripts, composes = [], []
+
+    def vsh(img, vol, script, timeout=600):
+        scripts.append(script)
+        return CP([], 0, "STAGED\nSWITCHED\nRESTORED\n" if script else "", "")
+
+    def run(argv, **kw):
+        if argv[:2] == ["docker", "ps"]:
+            return CP(argv, 0, "abc123\n", "")          # postgres still running
+        return CP(argv, 0, "VERIFIED\n", "")
+
+    monkeypatch.setattr(SB, "vsh", vsh)
+    monkeypatch.setattr(SB, "run", run)
+    monkeypatch.setattr(SB.time, "sleep", lambda s: None)
+    monkeypatch.setattr(SB, "basebackup", lambda *a, **k: CP([], 0, "", ""))
+    monkeypatch.setattr(SB, "compose", lambda h, st, args, **k: composes.append(args) or CP(args, 1, "", "stop failed"))
+    host = {"name": "nas-fleet", "compose_project": "gbrain"}
+    sb = {"slot": "gbrain_standby_nas_fleet"}
+    rc = SB.reseed_staged(host, Path("/nonexistent"), sb, "vol", "img", "net", "conn", "envf")
+    assert rc == 1
+    assert SB.switch_script() not in scripts and SB.restore_script() not in scripts
+    assert ["stop", "postgres"] in composes

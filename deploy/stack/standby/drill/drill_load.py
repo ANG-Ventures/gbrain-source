@@ -16,8 +16,8 @@ import subprocess
 import sys
 import threading
 import time
+import http.client
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 
@@ -44,9 +44,22 @@ def hits(text: str) -> int:
         return len([ln for ln in text.splitlines() if ln.strip()])
 
 
+def post(port: int, path: str, body: bytes, headers: dict, timeout: float) -> str:
+    """POST to 127.0.0.1:<port><path>: loopback only, scheme and host fixed here (semgrep dynamic-urllib-use).
+    An HTTP error status raises, as urlopen did."""
+    conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+    try:
+        conn.request("POST", path, body=body, headers=headers)
+        r = conn.getresponse()
+        text = r.read().decode()
+        if r.status >= 400:
+            raise OSError(f"HTTP {r.status}")
+        return text
+    finally:
+        conn.close()
+
 def searcher(rig: Path, port: int, f, stop):
     c = env_file(rig / "prove-client.env")
-    base = f"http://127.0.0.1:{port}"
     tok, exp = None, 0
     while not stop.is_set():
         t0 = time.time()
@@ -56,16 +69,12 @@ def searcher(rig: Path, port: int, f, stop):
                 form = urllib.parse.urlencode({"grant_type": "client_credentials",
                                                "client_id": c["GBRAIN_RAIL_CLIENT_ID"],
                                                "client_secret": c["GBRAIN_RAIL_CLIENT_SECRET"]}).encode()
-                with urllib.request.urlopen(urllib.request.Request(f"{base}/token", data=form), timeout=5) as r:
-                    d = json.loads(r.read().decode())
+                d = json.loads(post(port, "/token", form, {"Content-Type": "application/x-www-form-urlencoded"}, 5))
                 tok, exp = d["access_token"], time.time() + int(d.get("expires_in", 3600)) - 60
             body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                "params": {"name": "search", "arguments": {"query": "standby swap drill", "limit": 3}}})
-            req = urllib.request.Request(f"{base}/mcp", data=body.encode(), headers={
-                "Authorization": f"Bearer {tok}", "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                raw = r.read().decode()
+            raw = post(port, "/mcp", body.encode(), {"Authorization": f"Bearer {tok}", "Content-Type": "application/json",
+                                                     "Accept": "application/json, text/event-stream"}, 20)
             data = "".join(ln[5:].lstrip() for ln in raw.splitlines() if ln.startswith("data:")) or raw
             d = json.loads(data)
             text = ((d.get("result") or {}).get("content") or [{}])[0].get("text", "")

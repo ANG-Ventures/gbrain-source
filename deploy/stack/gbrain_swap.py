@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import http.client
 import json
 import os
 import re
@@ -49,9 +50,7 @@ import shlex
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -118,7 +117,7 @@ def wait(fn, seconds: float, every: float = 2.0) -> bool:
 
 
 def health(port: int) -> dict | None:
-    return SB.http_json(f"http://127.0.0.1:{port}/health", timeout=5)
+    return SB.http_json(port, "/health", timeout=5)
 
 
 def health_ok(port: int) -> bool:
@@ -483,28 +482,30 @@ def v_prove(L: Local, a) -> dict:
         k, sep, v = line.partition("=")
         if sep:
             env[k.strip()] = v.strip().strip("'\"")
-    base = f"http://127.0.0.1:{port}"
     form = urllib.parse.urlencode({"grant_type": "client_credentials", "client_id": env.get("GBRAIN_RAIL_CLIENT_ID", ""),
                                    "client_secret": env.get("GBRAIN_RAIL_CLIENT_SECRET", "")}).encode()
     try:
-        with urllib.request.urlopen(urllib.request.Request(f"{base}/token", data=form), timeout=15) as r:
-            tok = json.loads(r.read().decode()).get("access_token")
-    except (urllib.error.URLError, OSError, ValueError) as e:
+        status, text = SB.loopback(port, "POST", "/token", form,
+                                   {"Content-Type": "application/x-www-form-urlencoded"}, timeout=15)
+        if status >= 400:
+            raise StepFail(f"prove: token: HTTP {status}")
+        tok = json.loads(text).get("access_token")
+    except (OSError, ValueError, http.client.HTTPException) as e:
         raise StepFail(f"prove: token: {type(e).__name__}")
     if not tok:
         raise StepFail("prove: token endpoint returned no access_token")
     q = a.query or PROVE_QUERY
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                        "params": {"name": "search", "arguments": {"query": q, "limit": 3}}}).encode()
-    req = urllib.request.Request(f"{base}/mcp", data=body, headers={
-        "Authorization": f"Bearer {tok}", "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream"})
+    hdr = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json",
+           "Accept": "application/json, text/event-stream"}
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
-            raw = r.read().decode()
-    except (urllib.error.URLError, OSError) as e:
+        status, raw = SB.loopback(port, "POST", "/mcp", body, hdr, timeout=90)
+    except (OSError, http.client.HTTPException) as e:
         raise StepFail(f"prove: search: {type(e).__name__}: {e}")
+    if status >= 400:
+        raise StepFail(f"prove: search: HTTP {status}")
     ms = round((time.time() - t0) * 1000)
     data = "".join(ln[5:].lstrip() for ln in raw.splitlines() if ln.startswith("data:")) or raw
     try:
@@ -747,8 +748,27 @@ class Swap:
             self.log("refenced", checkpoint_was=prev, checkpoint_now=f.get("checkpoint_lsn"))
             self.st["fence"] = {**(self.st.get("fence") or {}), **f}
             self.save()
+        try:
+            pg = self.target.call("_status", timeout=120).get("pg") or {}
+        except Unreachable as e:
+            raise StepFail(f"promote: cannot read {self.target.name} ({e})")
+        if "in_recovery" not in pg:
+            raise StepFail(f"promote: {self.target.name} postgres unreadable ({pg.get('error')})")
+        if not pg["in_recovery"]:
+            # Resume after _promote ran but its result was not journaled (Prism 3cd6acbcced2): there is no replay
+            # position left to prove, and the catchup was proven before promote_started was written. Without that
+            # marker a primary target means something else promoted it: refuse.
+            if not self.st.get("promote_started"):
+                raise StepFail(f"promote: {self.target.name} is already a primary and this swap never started "
+                               f"its promotion: refusing")
+            chk = self.recheck_fenced("promote")
+            self.log("promote_resumed", promote_started=self.st["promote_started"])
+            return {**self.target.call("_promote", timeout=900), **chk, "resumed_after_promote": True,
+                    "checkpoint_lsn": f.get("checkpoint_lsn")}
         cu = self.s_catchup()
         chk = self.recheck_fenced("promote")
+        self.st["promote_started"] = now()
+        self.save()
         return {**self.target.call("_promote", timeout=900), **chk, "catchup_replay_lsn": cu.get("replay_lsn"),
                 "checkpoint_lsn": f.get("checkpoint_lsn")}
 

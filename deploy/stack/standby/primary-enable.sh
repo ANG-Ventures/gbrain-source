@@ -106,8 +106,11 @@ SQL
   edited=0
   cur=$(docker exec -e MARK="$MARK" "$pgc" sh -c 'grep -F -- "$MARK" "$PGDATA/pg_hba.conf" || true')
   if [[ $cur != "$HBA" ]]; then
+    # write a same-directory sibling that carries the live file's owner and mode, then rename it over: the live
+    # file is never truncated, so an interrupted run leaves it whole and a retry cannot back up a damaged copy
+    # (Prism 65fe0b3492ae)
     docker exec -e MARK="$MARK" -e HBA="$HBA" "$pgc" sh -c 'set -e; f="$PGDATA/pg_hba.conf"; cp -p "$f" "$f.pre-gbrain-standby"
-      { grep -vF -- "$MARK" "$f" || true; printf "%s\n" "$HBA"; } > "$f.new"; cat "$f.new" > "$f"; rm -f "$f.new"'
+      cp -p "$f" "$f.new"; { grep -vF -- "$MARK" "$f" || true; printf "%s\n" "$HBA"; } > "$f.new"; mv -f "$f.new" "$f"'
     edited=1
   fi
   echo "select pg_reload_conf();" | psql_ >/dev/null
@@ -138,8 +141,12 @@ SQL
   body=$(sudo -n cat "$KEYS") || { echo "cannot read $KEYS (sudo -n cat): stopping" >&2; exit 3; }
   have=$(grep -F -- "$MARK" <<<"$body" || true)
   if [[ $have != "$want" ]]; then
+    # same shape as pg_hba: a private sibling with the live file's owner and mode, renamed over it only after the
+    # write succeeded; the live file is never truncated (Prism 41289be4a5f6)
     sudo -n cp -p "$KEYS" "$KEYS.pre-gbrain-standby"
-    { [[ -z $body ]] || grep -vF -- "$MARK" <<<"$body" || true; printf '%s\n' "$want"; } | sudo -n tee "$KEYS" >/dev/null
+    sudo -n cp -p "$KEYS" "$KEYS.new"
+    { [[ -z $body ]] || grep -vF -- "$MARK" <<<"$body" || true; printf '%s\n' "$want"; } | sudo -n tee "$KEYS.new" >/dev/null
+    sudo -n mv -f "$KEYS.new" "$KEYS"
   fi
   check
   echo "APPLY=ok (next, on the standby: gbrainctl standby seed --host <standby>)"
@@ -153,7 +160,8 @@ undo() {
 select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '$slot';
 alter system reset max_slot_wal_keep_size;
 SQL
-  docker exec "$pgc" sh -c "{ grep -vF '$MARK' \"\$PGDATA/pg_hba.conf\" || true; } > /tmp/hba.new && cat /tmp/hba.new > \"\$PGDATA/pg_hba.conf\" && rm -f /tmp/hba.new"
+  docker exec -e MARK="$MARK" "$pgc" sh -c 'set -e; f="$PGDATA/pg_hba.conf"; cp -p "$f" "$f.new"
+    { grep -vF -- "$MARK" "$f" || true; } > "$f.new"; mv -f "$f.new" "$f"'
   echo "select pg_reload_conf();" | psql_ >/dev/null
   psql_ <<SQL
 do \$\$ begin
@@ -162,7 +170,7 @@ do \$\$ begin
 end \$\$;
 SQL
   if keys_has_mark; then
-    sudo -n sh -c "{ grep -vF '$MARK' '$KEYS' || true; } > '$KEYS.tmp' && cat '$KEYS.tmp' > '$KEYS' && rm -f '$KEYS.tmp'"
+    sudo -n sh -c "cp -p '$KEYS' '$KEYS.tmp' && { grep -vF '$MARK' '$KEYS' || true; } > '$KEYS.tmp' && mv -f '$KEYS.tmp' '$KEYS'"
   fi
   check
   echo "UNDO=ok"
