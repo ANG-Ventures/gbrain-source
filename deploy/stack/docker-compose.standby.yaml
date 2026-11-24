@@ -1,0 +1,68 @@
+# deploy/stack/docker-compose.standby.yaml: the gbrain WARM STANDBY overlay (card t_dd1e1edb, STANDBY.md). The mem0
+# standby's shape (mem0-selfhost-deploy stack/docker-compose.standby.yaml), one Postgres instead of Postgres + graph.
+# Loaded through a host profile whose compose_files names it (hosts/nas-fleet.toml), or added by `gbrainctl swap`
+# through <stack>/ROLE=standby on a host it demoted (gbrainctl compose_files()).
+#
+#  - primary-link: the ONE path to the primary. An ssh client (the rerank image ships /usr/bin/ssh: tunnel.sh) that
+#    logs in to the primary as a restricted forwarding-only user and forwards the primary's LOOPBACK Postgres and
+#    gbrain serve ports onto this compose network. Why ssh and not a LAN port + pg_hba: the Studio's Postgres runs
+#    under OrbStack, which NATs every inbound connection to the compose bridge gateway (measured for gbrain-pg
+#    2026-11-24: a 127.0.0.1:5433 client arrives as 192.168.172.1), so a "NAS only" pg_hba line cannot be written;
+#    the ssh key line pins from=<standby lan_ip> instead. Config, key and pinned host key: `gbrainctl standby init`
+#    renders them into secrets/standby/ (0600).
+#    The serve forward is published on THIS host's loopback serve port. That is the swap's flip: every gbrain caller
+#    lives on the Studio and calls 127.0.0.1:8199 (the mem0 prefetch's rail-prod client, rail.sh, the MCP shim), so
+#    when the Studio is the standby its link carries those calls to the NAS primary with no caller change. On the NAS
+#    standby the same port answers with the Studio's server; nothing on the NAS calls it.
+#  - postgres: unchanged image + data path; a hot standby because its data dir holds standby.signal and
+#    primary_conninfo (host=primary-link), written by `gbrainctl standby seed` (pg_basebackup -R -S <slot>).
+#  - server + cron: profile `promoted`. A bare `compose up -d` never starts them; `standby seed` only CREATES them, so
+#    the swap starts them without a build. gbrain serve writes (OAuth tokens, mcp_request_log, query_cache) and the
+#    cron imports: neither can run against a read-only replica, and exactly one cron may ever run.
+#  - rerank-proxy + rerank-tunnel stay as the base file has them (started): stateless, and the doctor reads the
+#    proxy's primary_ok so a standby's path to the GPU host is proven BEFORE a promotion needs it.
+services:
+  primary-link:
+    image: "${GBRAIN_RERANK_IMAGE:?GBRAIN_RERANK_IMAGE unset: run gbrainctl render}"
+    pull_policy: never
+    # A paced retry loop, not a crash loop: the primary's sshd penalises a source per failed auth (OpenSSH
+    # PerSourcePenalties), and this host's address is shared with the mem0 link and the prism relay.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        while :; do /usr/bin/ssh -F /run/standby/ssh_config -NT primary; echo "primary-link: ssh exited rc=$$?, retry in 15s" >&2;
+        sleep 15; done
+    volumes:
+      - ./secrets/standby:/run/standby:ro
+    ports:
+      - "127.0.0.1:${GBRAIN_SERVE_PORT:?GBRAIN_SERVE_PORT unset}:8199"
+    restart: unless-stopped
+    # bounded on every host (the Studio's orbstack policy refuses an uncapped container; one ssh client)
+    cpus: 0.25
+    mem_limit: 64m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+  postgres:
+    depends_on:
+      primary-link:
+        condition: service_started
+    # A standby's data dir starts only as a replica. A fenced old primary (ROLE=standby, before its reseed, or after
+    # `swap --no-reseed` / a failed reseed) still holds the old primary's cluster with no standby.signal: a plain
+    # `gbrainctl up` would start it READ-WRITE beside the promoted primary (Prism edafeabef444, d90aaf6cd1de). Refuse
+    # it; `standby seed` writes standby.signal (pg_basebackup -R) before it starts postgres here.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ ! -f /var/lib/postgresql/data/standby.signal ]; then
+        echo "postgres: refused: no standby.signal in the data dir (a fenced or never-seeded standby); run gbrainctl standby seed --reseed" >&2;
+        exit 78; fi; exec docker-entrypoint.sh postgres
+
+  server:
+    profiles: ["promoted"]
+
+  cron:
+    profiles: ["promoted"]

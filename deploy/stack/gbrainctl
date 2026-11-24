@@ -11,6 +11,10 @@ lib/mem0ctl/{render,compose,up}.py), one stdlib-only file (python >= 3.11 for to
   gbrainctl build   --host H [--repo DIR] build the host's three images from a CLEAN detached worktree at the
                                           host file's `revision` (never the caller's tree), for the host's arch
   gbrainctl status  --host H              compose ps + each running container's revision label vs the pin
+  gbrainctl standby init|seed|status|repin --host H    the warm standby (gbrain_standby.py, STANDBY.md)
+  gbrainctl swap --to H [--dry-run] | resume|undo|status <id>   the one swap command (gbrain_swap.py, STANDBY.md)
+
+<stack>/ROLE (written only by `swap`) adds or drops docker-compose.standby.yaml from the profile's compose_files.
 
 Refusals: on the production project (`gbrain`) `up`, `down` and every `compose` subcommand that is not read-only
 (anything outside READ_ONLY_COMPOSE: down, stop, rm, restart, kill, up, exec, run, ...) need --allow-prod.
@@ -283,10 +287,61 @@ def cmd_render(a) -> int:
     return 0
 
 
+STANDBY_OVERLAY = "docker-compose.standby.yaml"
+ROLE_FILE = "ROLE"
+
+
+def read_role(stack: Path) -> str | None:
+    """<stack>/ROLE (primary | standby), written only by `gbrainctl swap` (t_dd1e1edb). None = never swapped."""
+    try:
+        r = (stack / ROLE_FILE).read_text().strip()
+    except FileNotFoundError:
+        return None
+    return r if r in ("primary", "standby") else None
+
+
+def compose_files(h: dict, stack: Path) -> list[str]:
+    """The host profile's compose_files, with the standby overlay added or dropped by <stack>/ROLE: a host the swap
+    promoted composes WITHOUT it, a host it demoted composes WITH it (also the Studio, whose profile does not list
+    it). No ROLE file = the profile exactly, so a host that was never swapped composes as before."""
+    files = list(h.get("compose_files") or [])
+    role = read_role(stack)
+    if role == "primary":
+        files = [f for f in files if f != STANDBY_OVERLAY]
+    elif role == "standby" and STANDBY_OVERLAY not in files:
+        files.append(STANDBY_OVERLAY)
+    return files
+
+
+FENCE_FILE = "FENCE"
+
+
+def fence_guard_problem(h: dict, stack: Path) -> str | None:
+    """Why a changing compose command must not run here: a swap fenced this host (FENCE) but ROLE no longer says
+    standby, or this host's postgres container is the standby-guarded one (exit 78 without standby.signal) while the
+    files about to be composed lack the guard. The second reads docker, not the checkout: a cleanup that drops the
+    untracked ROLE/FENCE files cannot make an `up` start a fenced old primary read-write (read F3)."""
+    role = read_role(stack)
+    if (stack / FENCE_FILE).exists() and role != "standby":
+        return f"{stack / FENCE_FILE} says a swap fenced this host, but ROLE={role!r} (want standby)"
+    if STANDBY_OVERLAY in compose_files(h, stack):
+        return None
+    r = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={h['compose_project']}",
+                        "--filter", "label=com.docker.compose.service=postgres"], capture_output=True, text=True)
+    if r.returncode:
+        return f"docker ps rc={r.returncode}: cannot prove this host's postgres is not the fenced one"
+    for cid in r.stdout.split():
+        i = subprocess.run(["docker", "inspect", "-f", "{{json .Config.Cmd}}", cid], capture_output=True, text=True)
+        if i.returncode or ("standby.signal" in i.stdout and "exit 78" in i.stdout):
+            return (f"postgres container {cid} is the standby-guarded one (a fenced old primary or a standby) but "
+                    f"ROLE={role!r} composes without {STANDBY_OVERLAY}: it would start the old cluster read-write")
+    return None
+
+
 def compose_argv(h: dict, stack: Path) -> list[str]:
     argv = ["docker", "compose", "--project-directory", str(stack), "-p", h["compose_project"],
             "--env-file", str(stack / ".env")]
-    for f in h.get("compose_files") or []:
+    for f in compose_files(h, stack):
         argv += ["-f", str(stack / f)]
     return argv
 
@@ -329,6 +384,11 @@ def run_compose(h: dict, stack: Path, args: list[str], capture=False):
         # the project (-p) comes from the host file, the .env from the stack dir: a mismatch runs one host's project
         # on another host's .env (prod's container names, volume and secrets) past the --allow-prod check
         die(f"refusing compose for host {h['name']!r}: {env_file} was rendered for host {m.group(3)!r}", 3)
+    if args and args[0] not in READ_ONLY_COMPOSE:
+        bad = fence_guard_problem(h, stack)
+        if bad:
+            die(f"refusing `compose {args[0]}`: {bad}. Finish the swap (`gbrainctl swap resume <id>`), or follow "
+                f"STANDBY.md \"Promoted but not serving\"", 3)
     return subprocess.run(compose_argv(h, stack) + args, env=clean_env(), capture_output=capture, text=capture)
 
 
@@ -414,6 +474,14 @@ def cmd_status(a) -> int:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] in ("standby", "swap"):
+        # the warm standby and the swap (t_dd1e1edb, STANDBY.md): own modules beside this file, own argument parsers
+        sys.path.insert(0, str(STACK_REPO))
+        if argv[0] == "standby":   # a literal import per verb, no module name built from argv (semgrep)
+            import gbrain_standby as mod
+        else:
+            import gbrain_swap as mod
+        return mod.main(argv[1:])
     rest: list[str] = []
     if "--" in argv:
         i = argv.index("--")

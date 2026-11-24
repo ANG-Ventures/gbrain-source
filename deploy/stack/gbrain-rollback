@@ -166,6 +166,11 @@ def main(argv=None) -> int:
         ap.error(f"project {h['compose_project']!r} is not production: add --drill")
     if a.drill and (clash := W.drill_clashes(h)):
         ap.error("drill profile names production targets: " + "; ".join(clash))
+    # a host a standby swap touched: its data volume may hold a fenced old primary (or a replica); restarting it as
+    # the hand-run container would bypass the standby guard (STANDBY.md "Promoted but not serving")
+    if swapped := [f for f in ("ROLE", "FENCE") if (h["_stack"] / f).exists()]:
+        ap.error(f"{h['_stack']} holds {'/'.join(swapped)}: a standby swap changed this host; the launchd rollback "
+                 f"does not apply (STANDBY.md)")
     return W.Window("gbrain-rollback", a.apply, a.drill).run_steps(steps(h, a.drill))
 
 

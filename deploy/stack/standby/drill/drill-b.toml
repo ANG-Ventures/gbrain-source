@@ -1,0 +1,60 @@
+# standby/drill/drill-b.toml: the other half of the `gbrainctl swap` drill pair (card t_dd1e1edb, STANDBY.md). It
+# plays nas-fleet: the streaming standby of drill-a, seeded through the rig link with the real `standby seed`. Ports
+# 15434 / 18292 / 18282, data under /srv/gbrain-standby/drill-t_dd1e1edb/b. drill.sh fills @RIG@ and @HOSTKEY@.
+name            = "drill-b"
+os              = "linux"
+arch            = "amd64"
+lan_ip          = "127.0.0.1"
+docker_host_gw  = "host.docker.internal"
+revision        = "7969d9685cfb37a2d7c695a6a94d4d4aaa4f4ae7"
+server_image    = "gbrain-server:7969d9685cfb-amd64"
+rerank_image    = "gbrain-rerank:7969d9685cfb-amd64"
+cron_image      = "gbrain-cron:7969d9685cfb-amd64"
+compose_project = "gbrain-swapdrill-b"
+compose_files   = ["docker-compose.yaml", "docker-compose.nas-fleet.yaml", "docker-compose.standby.yaml"]
+stack_dir       = "@RIG@/home-b/deploy/stack"
+pg_container    = "gbrain-swapdrill-b-pg"
+pg_volume       = "gbrainswapdrill_b_pg"
+ports           = { pg = 15434, serve = 18292, rerank = 18282 }
+relay_ports     = { anthropic = 18810 }
+rerank_tunnel        = true
+rerank_tunnel_target = "ace@192.168.1.216"
+rerank_primary       = "http://rerank-tunnel:18084"
+nas_backup       = false
+stack_uid        = 1000
+stack_gid        = 1000
+gbrain_home      = "/srv/gbrain-standby/drill-t_dd1e1edb/b/gbrain"
+brain_source     = "/srv/gbrain-standby/drill-t_dd1e1edb/b/gbrain/brain"
+git_name         = "gbrain-swapdrill"
+git_email        = "gbrain-swapdrill@localhost"
+receipts_dir     = "@RIG@/receipts-b"
+backup_stamp_dir = "@RIG@/stamps-b"
+restic           = { repo = "/nonexistent/drill-never-armed", host = "gbrain-swapdrill-b", init_ok = 0 }
+op_reader       = "~/.local/bin/op-cached-read"
+op_bin          = "/usr/bin/op"
+op_token_file   = "~/.hermes/.op-service-token"
+
+[swap]
+drill            = true
+callers_host     = "drill-a"                     # the callers live on the old primary's host, as on the Studio
+callers_file     = "@RIG@/drill-a.toml"
+prove_client_env = "@RIG@/prove-client.env"
+
+[link]
+keys_file       = "@RIG@/sshd/authorized_keys"
+
+[standby]
+primary          = "drill-a"
+primary_file     = "@RIG@/drill-a.toml"
+link_ssh         = "_studiolink@192.168.1.154"
+link_port        = 22091
+link_host_key    = "@HOSTKEY@"
+link_from        = "172.16.0.0/12"
+primary_pg       = "127.0.0.1:15433"
+primary_serve    = "127.0.0.1:18291"
+repl_role        = "gbrain_repl_drill_b"
+slot             = "gbrain_standby_drill_b"
+application_name = "drill-b"
+data_root        = "/srv/gbrain-standby/drill-t_dd1e1edb/b"
+lag_page_s       = 60
+basebackup_rate  = "100M"

@@ -52,3 +52,35 @@ restic           = { repo = "sftp:truenas_admin@192.168.1.159:/mnt/tank/backups/
 op_reader       = "~/.hermes/scripts/op-cached-read"
 op_bin          = "/opt/homebrew/bin/op"
 op_token_file   = "~/.hermes/.op-service-token"
+
+# ---- the warm standby and the swap (t_dd1e1edb, STANDBY.md). Read by `gbrainctl standby` / `gbrainctl swap` only:
+# render, compose and status ignore these tables, and while this host is the primary (no <stack>/ROLE) nothing here
+# changes what it runs.
+lan_ip          = "192.168.1.18"
+
+[swap]
+ssh             = "alexgierczyk@192.168.1.18"
+python          = "/opt/homebrew/bin/python3.14"           # gbrainctl needs >= 3.11; the login python3 may be 3.9
+callers_host    = "studio"                                 # the mem0 prefetch, rail.sh and the MCP shim all live here
+prove_client_env = "~/gbrain/.gbrain/rail-cli.env"         # the OAuth client `swap` step prove searches as (rail-cli)
+
+# Where nas-fleet's standby link logs in while this host is the primary (primary-enable.sh appends its key line).
+[link]
+keys_file       = "/etc/ssh/studiolink_authorized_keys"
+
+# How the Studio follows nas-fleet AFTER `gbrainctl swap --to nas-fleet`. Unused while the Studio is the primary;
+# swap step reseed_old writes ROLE=standby here and runs `standby seed --reseed`, which builds the copy beside the old
+# cluster in the Studio's OWN volume (gbrain-pgdata: no data_root). The link is nas-fleet's sshd as _mem0link (the
+# mem0 reverse link login, already in place on nas-fleet).
+[standby]
+primary          = "nas-fleet"
+link_ssh         = "_mem0link@192.168.1.154"
+# nas-fleet's ed25519 host key (/etc/ssh/ssh_host_ed25519_key.pub, read 2026-11-24; = mem0's hosts/studio.toml)
+link_host_key    = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAATMGrV+UWW+UbzHtp+NRXwkhbE5C6mVAk5zlWnpLsy"
+primary_pg       = "127.0.0.1:5433"
+primary_serve    = "127.0.0.1:8199"
+repl_role        = "gbrain_repl_studio"    # its own role: the replicated cluster also holds nas-fleet's gbrain_repl
+slot             = "gbrain_standby_studio"
+application_name = "studio"
+lag_page_s       = 60
+basebackup_rate  = "100M"
