@@ -51,6 +51,8 @@ subnet_of() { docker network inspect "$1_default" -f '{{(index .IPAM.Config 0).S
 setup() {
   [[ -z $(git -C "$REPO" status --porcelain -- deploy/stack) ]] || { echo "dirty checkout: the halves run the reviewed bytes" >&2; exit 2; }
   sudo -n test -s "$DATA/a/pg/PG_VERSION" || { echo "no copy in $DATA/a/pg (STANDBY.md Drill: seed-copy first)" >&2; exit 2; }
+  # both halves' data roots, ours (init makes each brain repo as this user; pg/ is made by a root container)
+  sudo -n install -d -o "$(id -u)" -g "$(id -g)" "$DATA" "$DATA/a" "$DATA/b"
   docker image inspect "$SSHD_IMAGE" >/dev/null
   # a private rig (the sshd runs StrictModes no, so its authorized_keys must be ours alone; Prism 2f422479f108):
   # a new rig is made 0700 and marked; an existing one must already be the drill's, then it is made private again
