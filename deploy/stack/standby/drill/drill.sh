@@ -175,10 +175,10 @@ teardown() {
     docker network rm "${p}_default" >/dev/null 2>&1 || true
   done
   docker rm -f gbrain-swapdrill-sshd >/dev/null 2>&1 || true
-  docker volume ls -q | grep -E '^gbrain-?swapdrill' | xargs -r docker volume rm >/dev/null
+  { docker volume ls -q | grep -E '^gbrain-?swapdrill' || true; } | xargs -r docker volume rm >/dev/null
   sudo -n rm -rf "$DATA"
   rm -rf "$RIG"
-  echo "TEARDOWN=ok left: containers=$(docker ps -a --format '{{.Names}}' | grep -c swapdrill) volumes=$(docker volume ls -q | grep -cE '^gbrain-?swapdrill')"
+  echo "TEARDOWN=ok left: containers=$(docker ps -a --format '{{.Names}}' | grep -c swapdrill || true) volumes=$(docker volume ls -q | grep -cE '^gbrain-?swapdrill' || true)"
 }
 
 case ${1:-} in
