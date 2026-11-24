@@ -35,6 +35,15 @@ def log(f, rec):
     f.flush()
 
 
+def hits(text: str) -> int:
+    """The hit count of a search answer, parsed the way gbrain_swap.v_prove reads it."""
+    try:
+        h = json.loads(text)
+        return len(h if isinstance(h, list) else h.get("results", []))
+    except (ValueError, AttributeError):
+        return len([ln for ln in text.splitlines() if ln.strip()])
+
+
 def searcher(rig: Path, port: int, f, stop):
     c = env_file(rig / "prove-client.env")
     base = f"http://127.0.0.1:{port}"
@@ -60,7 +69,9 @@ def searcher(rig: Path, port: int, f, stop):
             data = "".join(ln[5:].lstrip() for ln in raw.splitlines() if ln.startswith("data:")) or raw
             d = json.loads(data)
             text = ((d.get("result") or {}).get("content") or [{}])[0].get("text", "")
-            rec["ok"] = bool(text.strip()) and "error" not in d and not (d.get("result") or {}).get("isError")
+            rec["hits"] = hits(text)
+            # ok = an answer WITH hits: `[]` is a caller that still has nothing (Prism 252e2a694d24)
+            rec["ok"] = rec["hits"] > 0 and "error" not in d and not (d.get("result") or {}).get("isError")
         except Exception as e:  # noqa: BLE001 - every failure is a data point
             rec["ok"], rec["err"] = False, f"{type(e).__name__}: {str(e)[:80]}"
             tok = None if "401" in str(e) else tok
@@ -76,9 +87,13 @@ def writer(halves: list[str], f, stop):
         n += 1
         rec = {"t": round(t0, 3), "kind": "write", "seq": n, "ok": False}
         for c in halves:
-            r = subprocess.run(["docker", "exec", c, "psql", "-X", "-At", "-U", "gbrain", "-d", "gbrain", "-c",
-                                f"insert into swapdrill_acks(seq) values ({n}) returning id"],
-                               capture_output=True, text=True, timeout=10)
+            try:
+                r = subprocess.run(["docker", "exec", c, "psql", "-X", "-At", "-U", "gbrain", "-d", "gbrain", "-c",
+                                    f"insert into swapdrill_acks(seq) values ({n}) returning id"],
+                                   capture_output=True, text=True, timeout=10)
+            except subprocess.TimeoutExpired:   # a failed attempt, not the end of the writer (Prism a7a800cba8e7)
+                rec.setdefault("errs", []).append(f"{c}: timeout 10s")
+                continue
             if r.returncode == 0 and r.stdout.strip().splitlines()[:1] and r.stdout.strip().splitlines()[0].isdigit():
                 rec.update(ok=True, via=c, id=int(r.stdout.strip().splitlines()[0]))
                 break
@@ -113,8 +128,11 @@ def summary(rig: Path, newp: str) -> int:
     missing = [i for i in acked if i not in have]
     out["acked_writes"] = {"acked": len(acked), "present_on_new_primary": len(acked) - len(missing),
                            "missing": missing[:20]}
+    # no evidence is not a pass: a failed read of the new primary, or not one acked write (Prism e4391a7df3ec)
+    if q.returncode:
+        out["acked_writes"]["error"] = f"query rc={q.returncode}: {q.stderr.strip()[-120:]}"
     print(json.dumps(out))
-    return 0 if not missing else 1
+    return 0 if (not missing and acked and q.returncode == 0) else 1
 
 
 def main() -> int:

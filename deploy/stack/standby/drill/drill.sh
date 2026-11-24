@@ -40,16 +40,23 @@ health_wait() {  # port seconds
   for _ in $(seq "$2"); do curl -fsS -m 3 "http://127.0.0.1:$1/health" 2>/dev/null | grep -q '"engine":"postgres"' && return 0; sleep 1; done
   echo "drill.sh: 127.0.0.1:$1/health never said engine=postgres" >&2; return 1
 }
+OWN=.gbrain-swapdrill-rig   # written by setup into a rig it made: teardown deletes only a rig that carries it
+VOLS="gbrainswapdrill_a_pg gbrainswapdrill_b_pg"   # the drill profiles' pg_volume (external: no compose label)
 subnet_of() { docker network inspect "$1_default" -f '{{(index .IPAM.Config 0).Subnet}}'; }
 
 setup() {
   [[ -z $(git -C "$REPO" status --porcelain -- deploy/stack) ]] || { echo "dirty checkout: the halves run the reviewed bytes" >&2; exit 2; }
   sudo -n test -s "$DATA/a/pg/PG_VERSION" || { echo "no copy in $DATA/a/pg (STANDBY.md Drill: seed-copy first)" >&2; exit 2; }
   docker image inspect "$SSHD_IMAGE" >/dev/null
-  mkdir -p "$RIG/sshd" "$RIG/state"
+  # a private rig (the sshd runs StrictModes no, so its authorized_keys must be ours alone; Prism 2f422479f108):
+  # a new rig is made 0700 and marked; an existing one must already be the drill's, then it is made private again
+  if [[ -e $RIG && ! -e $RIG/$OWN ]]; then echo "$RIG exists and is not a drill rig (no $OWN): refusing" >&2; exit 2; fi
+  (umask 077; mkdir -p "$RIG/sshd" "$RIG/state")
+  touch "$RIG/$OWN"
+  chmod 700 "$RIG" "$RIG/sshd" "$RIG/state"
   [[ -f $RIG/sshd/ssh_host_ed25519_key ]] || ssh-keygen -q -t ed25519 -N '' -C gbrain-swapdrill-rig -f "$RIG/sshd/ssh_host_ed25519_key"
   local hk; hk=$(cut -d' ' -f1,2 "$RIG/sshd/ssh_host_ed25519_key.pub")
-  touch "$RIG/sshd/authorized_keys"
+  touch "$RIG/sshd/authorized_keys"; chmod 600 "$RIG/sshd/authorized_keys"
   cat > "$RIG/sshd/sshd_config" <<EOF
 Port $RIG_PORT
 ListenAddress $RIG_ADDR
@@ -94,8 +101,16 @@ cid = re.search(r"Client ID:\s+(\S+)", t)
 sec = re.search(r"Client Secret:\s+(\S+)", t)
 if not cid or not sec or sec.group(1).startswith("<"):
     sys.exit("register-client output not understood: " + re.sub(r"Secret:\s+\S+", "Secret: <redacted>", t)[-400:])
-fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+# a fresh 0600 file renamed over the old one: an existing file's looser mode never carries over (Prism d3858b8802f0)
+tmp = sys.argv[1] + ".tmp"
+try:
+    os.unlink(tmp)
+except FileNotFoundError:
+    pass
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 os.write(fd, f"GBRAIN_RAIL_CLIENT_ID={cid.group(1)}\nGBRAIN_RAIL_CLIENT_SECRET={sec.group(1)}\n".encode())
+os.close(fd)
+os.replace(tmp, sys.argv[1])
 print("prove client written", cid.group(1)[:16] + "...")
 PY
   say "A: the full stack (server, rerank, cron NEVER armed)"
@@ -156,14 +171,18 @@ run() {  # the whole drill after setup: swap to B under load, swap back to A und
     "create table if not exists swapdrill_acks(id bigserial primary key, seq int, at timestamptz default now())"
   sleep 3
   ctl standby status --host-file "$B" | tail -1
-  one_swap b gbrain-swapdrill-b-pg
+  local rc=0
+  one_swap b gbrain-swapdrill-b-pg || rc=1
   say "after swap 1: the new standby (A)"
-  ctl standby status --host-file "$A" || true
+  ctl standby status --host-file "$A" || { echo "DRILL: A is not a FRESH, ELIGIBLE standby after swap 1" >&2; rc=1; }
   probe
-  one_swap a gbrain-swapdrill-a-pg
+  one_swap a gbrain-swapdrill-a-pg || rc=1
   say "after swap 2: the standby (B)"
-  ctl standby status --host-file "$B" || true
+  # the drill passes only on FRESH + ELIGIBLE=yes here (Prism 7d044f6fada7)
+  ctl standby status --host-file "$B" || { echo "DRILL: B is not a FRESH, ELIGIBLE standby after swap 2" >&2; rc=1; }
   probe
+  echo "DRILL=$([[ $rc == 0 ]] && echo ok || echo failed)"
+  return $rc
 }
 
 teardown() {
@@ -175,10 +194,19 @@ teardown() {
     docker network rm "${p}_default" >/dev/null 2>&1 || true
   done
   docker rm -f gbrain-swapdrill-sshd >/dev/null 2>&1 || true
-  { docker volume ls -q | grep -E '^gbrain-?swapdrill' || true; } | xargs -r docker volume rm >/dev/null
+  # only the drill's own volumes: the two projects' (by compose label) and the two pg volumes by exact name, never a
+  # name prefix (Prism e5e1befcbdfe)
+  local v
+  for v in $(docker volume ls -q --filter label=com.docker.compose.project=gbrain-swapdrill-a) \
+           $(docker volume ls -q --filter label=com.docker.compose.project=gbrain-swapdrill-b) $VOLS; do
+    docker volume inspect "$v" >/dev/null 2>&1 && docker volume rm "$v" >/dev/null
+  done
   sudo -n rm -rf "$DATA"
-  rm -rf "$RIG"
-  echo "TEARDOWN=ok left: containers=$(docker ps -a --format '{{.Names}}' | grep -c swapdrill || true) volumes=$(docker volume ls -q | grep -cE '^gbrain-?swapdrill' || true)"
+  # the rig only when setup made it (Prism 36c5cf4c7e7b)
+  if [[ -e $RIG/$OWN ]]; then rm -rf "$RIG"; elif [[ -e $RIG ]]; then echo "$RIG has no $OWN: not a drill rig, left as is" >&2; fi
+  local left=0
+  for v in $VOLS; do docker volume inspect "$v" >/dev/null 2>&1 && left=$((left + 1)); done
+  echo "TEARDOWN=ok left: containers=$(docker ps -a --format '{{.Names}}' | grep -c swapdrill || true) volumes=$left"
 }
 
 case ${1:-} in

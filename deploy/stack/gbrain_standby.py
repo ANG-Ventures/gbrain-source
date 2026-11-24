@@ -222,9 +222,10 @@ def cmd_init(host: dict, sb: dict, stack: Path) -> int:
         # a standby host has no brain repo of its own (the exporters write the Studio's): an EMPTY repo, so a promoted
         # standby's nightly-sync finds nothing new instead of failing on a missing mount (STANDBY.md)
         uid, gid = int(host["stack_uid"]), int(host["stack_gid"])
+        # the paths go in as argv, never into the shell text (Prism ce0f2932ea1f)
         mk = run(["docker", "run", "--rm", "-v", f"{sb['data_root']}:/r", "--entrypoint", "sh", pg_image_of(stack),
-                  "-c", f"install -d -o {uid} -g {gid} -m 755 /r/{brain.parent.relative_to(sb['data_root'])} "
-                        f"/r/{brain.relative_to(sb['data_root'])} && echo MADE"])
+                  "-c", 'install -d -o "$1" -g "$2" -m 755 -- "$3" "$4" && echo MADE', "sh", str(uid), str(gid),
+                  f"/r/{brain.parent.relative_to(sb['data_root'])}", f"/r/{brain.relative_to(sb['data_root'])}"])
         if "MADE" not in mk.stdout:
             die(f"cannot create {brain}: {mk.stderr.strip()[-200:]}")
         g = run(["git", "init", "-q", str(brain)])
@@ -256,11 +257,14 @@ def pg_image_of(stack: Path) -> str:
 
 def container(project: str, service: str) -> dict | None:
     r = run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={project}",
-             "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.ID}}"])
-    ids = r.stdout.split()
+             "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.ID}} {{.State}}"])
+    rows = [ln.split() for ln in r.stdout.splitlines() if ln.strip()]
+    ids = [x[0] for x in rows]
     if r.returncode or not ids:
         return None
-    i = run(["docker", "inspect", ids[0]])
+    # a running one (a writer) wins over a newer stopped one-off with the same service label (Prism 68c4d14cd4e3)
+    pick = next((x[0] for x in rows if len(x) > 1 and x[1] == "running"), ids[0])
+    i = run(["docker", "inspect", pick])
     if i.returncode:
         return None
     c = json.loads(i.stdout)[0]
@@ -516,6 +520,25 @@ def compose(host, stack, args, **kw):
 
 
 NEXT, OLD = ".reseed-next", ".reseed-old"   # inside the volume: same filesystem, so the switch is renames only
+MOVED = ".reseed-old-complete"              # written only once EVERY old entry is in OLD (the switch's phase 1)
+
+
+def switch_script() -> str:
+    """Phase 1 moves the old cluster into OLD, then writes MOVED; phase 2 moves the new copy up. restore_script()
+    reads which phase was reached, so a failure in phase 1 never deletes an old file (Prism 0e1fd66f8301)."""
+    return (f"set -e; cd /d; mkdir -m 700 {OLD}; "
+            f"find . -mindepth 1 -maxdepth 1 ! -name {NEXT} ! -name {OLD} -exec mv -t {OLD} {{}} +; touch {MOVED}; "
+            f"find {NEXT} -mindepth 1 -maxdepth 1 -exec mv -t . {{}} +; rmdir {NEXT}; echo SWITCHED")
+
+
+def restore_script() -> str:
+    """No OLD: nothing of the old cluster moved (mkdir failed), keep it as is. OLD without MOVED: phase 1 stopped
+    part-way, no new file is up yet, so only move OLD's entries back. MOVED: the old cluster is whole in OLD, so what
+    is outside it is the new copy (or part of it): remove that, then move OLD back."""
+    return (f"set -e; cd /d; "
+            f"if [ ! -d {OLD} ]; then rm -rf {NEXT}; echo RESTORED; exit 0; fi; "
+            f"if [ -e {MOVED} ]; then find . -mindepth 1 -maxdepth 1 ! -name {OLD} ! -name {MOVED} -exec rm -rf {{}} +; fi; "
+            f"find {OLD} -mindepth 1 -maxdepth 1 -exec mv -t . {{}} +; rmdir {OLD}; rm -rf {NEXT} {MOVED}; echo RESTORED")
 
 
 def vsh(pg_image: str, vol: str, script: str, timeout: int = 600) -> subprocess.CompletedProcess:
@@ -580,7 +603,7 @@ def reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf) -> int:
         print(f"SEED=fail host={name} step={step}: {why}; the old cluster was not touched")
         return 1
 
-    st = vsh(pg_image, vol, f"test -e /d/{OLD} && echo OLD; rm -rf /d/{NEXT}; "
+    st = vsh(pg_image, vol, f"test -e /d/{OLD} -o -e /d/{MOVED} && echo OLD; rm -rf /d/{NEXT}; "
                             f"install -d -o 999 -g 999 -m 700 /d/{NEXT} && echo STAGED", timeout=3600)
     if "OLD" in st.stdout:
         die(f"{vol}/{OLD} exists: an earlier reseed stopped mid-switch; inspect it by hand before reseeding", 3)
@@ -597,19 +620,14 @@ def reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf) -> int:
 
     def restore(step, why):
         compose(host, stack, ["stop", "postgres"], timeout=300)
-        b = vsh(pg_image, vol, f"set -e; cd /d; find . -mindepth 1 -maxdepth 1 ! -name {OLD} -exec rm -rf {{}} +; "
-                               f"find {OLD} -mindepth 1 -maxdepth 1 -exec mv -t . {{}} +; rmdir {OLD}; echo RESTORED",
-                timeout=3600)
+        b = vsh(pg_image, vol, restore_script(), timeout=3600)
         drop_next()
         print(f"SEED=fail host={name} step={step}: {why}; "
               + ("the old cluster is back (stopped)" if "RESTORED" in b.stdout else f"RESTORE FAILED: it is in {OLD}"))
         return 1
 
     compose(host, stack, ["stop", "postgres"], timeout=300)
-    sw = vsh(pg_image, vol, f"set -e; cd /d; mkdir -m 700 {OLD}; "
-                            f"find . -mindepth 1 -maxdepth 1 ! -name {NEXT} ! -name {OLD} -exec mv -t {OLD} {{}} +; "
-                            f"find {NEXT} -mindepth 1 -maxdepth 1 -exec mv -t . {{}} +; rmdir {NEXT}; echo SWITCHED",
-             timeout=3600)
+    sw = vsh(pg_image, vol, switch_script(), timeout=3600)
     if "SWITCHED" not in sw.stdout:
         return restore("switch", f"moving the new copy up failed: {sw.stderr.strip()[-200:]}")
     up = compose(host, stack, ["up", "-d", "--no-deps", "postgres"], timeout=600)
@@ -632,7 +650,7 @@ def reseed_staged(host, stack, sb, vol, pg_image, net, conn, envf) -> int:
               f"({(cp.stderr or d.stderr).strip()[-200:]}); it streams on {nxt}, old copy kept in {OLD}")
         return 1
     drop_next()
-    vsh(pg_image, vol, f"rm -rf /d/{OLD}", timeout=3600)
+    vsh(pg_image, vol, f"rm -rf /d/{OLD} /d/{MOVED}", timeout=3600)
     print(f"reseed ok: old copy removed, standby on {slot}", flush=True)
     return 0
 
@@ -648,6 +666,13 @@ def cmd_seed(host: dict, sb: dict, stack: Path, reseed: bool) -> int:
     if r.returncode:
         die(f"primary-link up failed: {r.stderr.strip()[-300:]}")
     vol = host["pg_volume"]
+    # before the first mount: `docker run -v <missing name>` would CREATE a plain local volume and the base backup
+    # would land on docker's disk instead of the standby dataset (Prism 2ef9e97167cb)
+    have_v = run(["docker", "volume", "inspect", "-f", "{{.Options.device}}", vol])
+    if have_v.returncode:
+        die(f"docker volume {vol} missing: run `gbrainctl standby init` first", 3)
+    if sb.get("data_root") and have_v.stdout.strip() != f"{sb['data_root'].rstrip('/')}/pg":
+        die(f"docker volume {vol} binds {have_v.stdout.strip()!r}, not {sb['data_root'].rstrip('/')}/pg", 3)
     probe = vsh(pg_image, vol, "test -s /d/PG_VERSION && echo HAS || echo EMPTY")
     has = "HAS" in probe.stdout
     if has and not reseed:
@@ -680,6 +705,10 @@ def cmd_seed(host: dict, sb: dict, stack: Path, reseed: bool) -> int:
     r = compose(host, stack, ["up", "-d", "--no-deps", "postgres"])
     if r.returncode:
         die(f"compose up postgres failed: {r.stderr.strip()[-300:]}", 1)
+    # SEED=ok means a replica that streams, not a started container (Prism a6df8203dcb4)
+    if not any(pg_streaming(host) or time.sleep(2) for _ in range(90)):
+        print(f"SEED=fail host={host['name']} step=stream: postgres is up but not in recovery + streaming after 180s")
+        return 1
     # the rerank pair runs on a standby too (stateless; the doctor proves the GPU path from here)
     r = compose(host, stack, ["up", "-d", "--no-deps", "rerank-proxy"]
                 + (["rerank-tunnel"] if host.get("rerank_tunnel") else []))

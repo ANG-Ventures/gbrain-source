@@ -66,7 +66,7 @@ All of these run with the Studio serving; nothing on the primary is recreated or
    # on the Studio, from the deploy checkout (M = this PR's merge commit, already fetched there)
    git -C ~/gbrain-stack-live bundle create /tmp/gbs.bundle origin/master
    scp /tmp/gbs.bundle ace@192.168.1.154:/tmp/ && shasum -a 256 /tmp/gbs.bundle
-   ssh ace@192.168.1.154 'sha256sum /tmp/gbs.bundle; cd ~/gbrain-standby && git fetch -q /tmp/gbs.bundle master \
+   ssh ace@192.168.1.154 'sha256sum /tmp/gbs.bundle; cd ~/gbrain-standby && git fetch -q /tmp/gbs.bundle refs/remotes/origin/master \
      && git checkout -q --detach <M> && git log --oneline -1'
    ssh ace@192.168.1.154 'cd ~/gbrain-standby/deploy/stack && python3 ./gbrainctl build --host nas-fleet'
    #   BUILD=ok revision=7969d968... arch=amd64 (the three images are already there from the drill: id check below)

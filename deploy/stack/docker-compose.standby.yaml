@@ -50,6 +50,16 @@ services:
     depends_on:
       primary-link:
         condition: service_started
+    # A standby's data dir starts only as a replica. A fenced old primary (ROLE=standby, before its reseed, or after
+    # `swap --no-reseed` / a failed reseed) still holds the old primary's cluster with no standby.signal: a plain
+    # `gbrainctl up` would start it READ-WRITE beside the promoted primary (Prism edafeabef444, d90aaf6cd1de). Refuse
+    # it; `standby seed` writes standby.signal (pg_basebackup -R) before it starts postgres here.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        if [ ! -f /var/lib/postgresql/data/standby.signal ]; then
+        echo "postgres: refused: no standby.signal in the data dir (a fenced or never-seeded standby); run gbrainctl standby seed --reseed" >&2;
+        exit 78; fi; exec docker-entrypoint.sh postgres
 
   server:
     profiles: ["promoted"]

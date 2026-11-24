@@ -101,9 +101,13 @@ grant pg_monitor to $role;
 alter system set max_slot_wal_keep_size = '8GB';
 select pg_reload_conf();
 SQL
+  # the tagged line must be EXACTLY $HBA: a recreated network moves the gateway, and a stale tagged line would keep
+  # refusing the new one (Prism 65fe0b3492ae). Replace the tagged line(s), keep every other line.
   edited=0
-  if ! docker exec "$pgc" sh -c "grep -qF '$MARK' \"\$PGDATA/pg_hba.conf\""; then
-    docker exec "$pgc" sh -c "cp -p \"\$PGDATA/pg_hba.conf\" \"\$PGDATA/pg_hba.conf.pre-gbrain-standby\" && printf '%s\n' '$HBA' >> \"\$PGDATA/pg_hba.conf\""
+  cur=$(docker exec -e MARK="$MARK" "$pgc" sh -c 'grep -F -- "$MARK" "$PGDATA/pg_hba.conf" || true')
+  if [[ $cur != "$HBA" ]]; then
+    docker exec -e MARK="$MARK" -e HBA="$HBA" "$pgc" sh -c 'set -e; f="$PGDATA/pg_hba.conf"; cp -p "$f" "$f.pre-gbrain-standby"
+      { grep -vF -- "$MARK" "$f" || true; printf "%s\n" "$HBA"; } > "$f.new"; cat "$f.new" > "$f"; rm -f "$f.new"'
     edited=1
   fi
   echo "select pg_reload_conf();" | psql_ >/dev/null
@@ -119,12 +123,23 @@ SQL
     fi
     exit 1
   fi
-  if ! keys_has_mark; then
-    sudo -n cp -p "$KEYS" "$KEYS.pre-gbrain-standby"
-    if sudo -n test -s "$KEYS" && [[ $(sudo -n tail -c1 "$KEYS" | od -An -c | tr -d ' ') != '\n' ]]; then
-      printf '\n' | sudo -n tee -a "$KEYS" >/dev/null
+  exact=$(echo "select count(*) from pg_hba_file_rules where '$role'=any(user_name) and 'replication'=any(database) and address='$gw' and netmask='255.255.255.255' and error is null;" | psql_)
+  if [[ $exact != 1 ]]; then
+    echo "pg_hba: the loaded rules hold $exact replication line(s) for $role from $gw/32 (want 1)" >&2
+    if [[ $edited == 1 ]]; then
+      docker exec "$pgc" sh -c 'cp -p "$PGDATA/pg_hba.conf.pre-gbrain-standby" "$PGDATA/pg_hba.conf"'
+      echo "select pg_reload_conf();" | psql_ >/dev/null
     fi
-    printf '%s %s\n' "$STANDBY_KEY_LINE" "$MARK" | sudo -n tee -a "$KEYS" >/dev/null
+    exit 1
+  fi
+  # the tagged key line must be EXACTLY this standby's: a rebuilt standby or a rotated key replaces it, other lines
+  # stay (Prism 94a4f0a892e6). A refused sudo read stops here, never reads as "no line".
+  want="$STANDBY_KEY_LINE $MARK"
+  body=$(sudo -n cat "$KEYS") || { echo "cannot read $KEYS (sudo -n cat): stopping" >&2; exit 3; }
+  have=$(grep -F -- "$MARK" <<<"$body" || true)
+  if [[ $have != "$want" ]]; then
+    sudo -n cp -p "$KEYS" "$KEYS.pre-gbrain-standby"
+    { [[ -z $body ]] || grep -vF -- "$MARK" <<<"$body" || true; printf '%s\n' "$want"; } | sudo -n tee "$KEYS" >/dev/null
   fi
   check
   echo "APPLY=ok (next, on the standby: gbrainctl standby seed --host <standby>)"
@@ -132,9 +147,10 @@ SQL
 
 undo() {
   need_sudo
-  # the standby must be stopped first, or the slot is active and cannot be dropped
+  # the standby must be stopped first: an ACTIVE slot makes the drop fail, and the undo stops there with nothing
+  # after it changed (Prism eb13f9b40a5b; the old `and not active` skipped it and reported UNDO=ok)
   psql_ <<SQL
-select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '$slot' and not active;
+select pg_drop_replication_slot(slot_name) from pg_replication_slots where slot_name = '$slot';
 alter system reset max_slot_wal_keep_size;
 SQL
   docker exec "$pgc" sh -c "{ grep -vF '$MARK' \"\$PGDATA/pg_hba.conf\" || true; } > /tmp/hba.new && cat /tmp/hba.new > \"\$PGDATA/pg_hba.conf\" && rm -f /tmp/hba.new"

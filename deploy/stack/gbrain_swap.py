@@ -25,7 +25,8 @@ its `[swap] ssh` in its stack_dir). Steps, each journaled:
   2 fence       old: FENCE records this swap's id (another swap's live fence is refused), ROLE=standby, server + cron
                 stopped, ARMED cleared (was_armed recorded), postgres stopped; proven: pg_controldata "shut down"
   3 catchup     target: replay LSN >= that checkpoint (zero loss)
-  4 promote     the old primary re-read: still fenced by THIS swap; target: pg_promote(), primary_conninfo + slot
+  4 promote     the old primary re-fenced (same id: its CURRENT shutdown checkpoint), catchup re-proven against it,
+                still fenced by THIS swap; target: pg_promote(), primary_conninfo + slot
                 reset, ROLE=primary, link removed, postgres recreated without the standby overlay; not in recovery
   5 start       target: ARMED as the old one was, server + cron + rerank up, /health engine=postgres, exactly 1 cron
                 running there and 0 on the old primary
@@ -737,8 +738,19 @@ class Swap:
                                 timeout=CATCHUP_S * 2 + 60)
 
     def s_promote(self):
+        # Re-read the old primary's shutdown checkpoint now (the fence verb is idempotent for this swap id) and prove
+        # catchup against THAT checkpoint: a re-fence after a restart writes a newer one, and the catchup journaled
+        # before it does not cover the WAL in between (Prism 0f16f7498863).
+        f = self.old.call("_fence", "--swap-id", self.id, timeout=600)
+        prev = (self.st.get("fence") or {}).get("checkpoint_lsn")
+        if f.get("checkpoint_lsn") != prev:
+            self.log("refenced", checkpoint_was=prev, checkpoint_now=f.get("checkpoint_lsn"))
+            self.st["fence"] = {**(self.st.get("fence") or {}), **f}
+            self.save()
+        cu = self.s_catchup()
         chk = self.recheck_fenced("promote")
-        return {**self.target.call("_promote", timeout=900), **chk}
+        return {**self.target.call("_promote", timeout=900), **chk, "catchup_replay_lsn": cu.get("replay_lsn"),
+                "checkpoint_lsn": f.get("checkpoint_lsn")}
 
     def s_start(self):
         arm = "yes" if (self.st.get("fence") or {}).get("was_armed") else "no"

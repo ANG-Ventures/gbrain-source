@@ -260,3 +260,100 @@ def test_side_verbs_refuse_without_swap_id(tmp_path):
     a.swap_id = "x; rm -rf /"
     with pytest.raises(SW.StepFail):
         SW.need_sid(a)
+
+
+# ---------------------------------------------------------------- Prism round 1 (t_dd1e1edb)
+
+def _sh(d: Path, script: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["sh", "-c", script.replace("cd /d", f"cd {d}")], capture_output=True, text=True)
+
+
+def _files(d: Path) -> list[str]:
+    return sorted(str(p.relative_to(d)) for p in d.rglob("*") if p.is_file())
+
+
+def _cluster(d: Path, names, sub="") -> None:
+    for n in names:
+        p = d / sub / n
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(n)
+
+
+def test_reseed_restore_never_deletes_an_old_cluster_that_did_not_move(tmp_path):
+    # mkdir OLD fails (phase 1 never started): the old cluster stays, the staged copy goes
+    _cluster(tmp_path, ["PG_VERSION", "base/1"])
+    _cluster(tmp_path, ["PG_VERSION", "standby.signal"], SB.NEXT)
+    (tmp_path / "blocker").write_text("")
+    sw = SB.switch_script().replace(f"mkdir -m 700 {SB.OLD}", f"mkdir -m 700 blocker/{SB.OLD}")
+    assert "SWITCHED" not in _sh(tmp_path, sw).stdout
+    assert "RESTORED" in _sh(tmp_path, SB.restore_script()).stdout
+    assert _files(tmp_path) == ["PG_VERSION", "base/1", "blocker"]
+
+
+def test_reseed_restore_after_a_partial_phase_one(tmp_path):
+    _cluster(tmp_path, ["PG_VERSION", "base/1"])
+    _cluster(tmp_path, ["global/x"], SB.OLD)                  # moved before the stop, no MOVED marker
+    _cluster(tmp_path, ["PG_VERSION", "standby.signal"], SB.NEXT)
+    assert "RESTORED" in _sh(tmp_path, SB.restore_script()).stdout
+    assert _files(tmp_path) == ["PG_VERSION", "base/1", "global/x"]
+
+
+def test_reseed_switch_then_restore_round_trip(tmp_path):
+    _cluster(tmp_path, ["PG_VERSION", "base/1", "global/x"])
+    _cluster(tmp_path, ["PG_VERSION", "standby.signal", "base/2"], SB.NEXT)
+    assert "SWITCHED" in _sh(tmp_path, SB.switch_script()).stdout
+    assert "standby.signal" in _files(tmp_path)
+    assert "RESTORED" in _sh(tmp_path, SB.restore_script()).stdout
+    assert _files(tmp_path) == ["PG_VERSION", "base/1", "global/x"]
+
+
+def test_standby_overlay_refuses_postgres_without_standby_signal():
+    t = (STACK / "docker-compose.standby.yaml").read_text()
+    m = re.search(r"^  postgres:\n(.*?)(?=^  \S)", t, re.M | re.S)
+    assert m
+    body = m.group(1)
+    assert 'entrypoint: ["/bin/sh", "-c"]' in body
+    assert "if [ ! -f /var/lib/postgresql/data/standby.signal ]; then" in body
+    assert "exit 78; fi; exec docker-entrypoint.sh postgres" in body
+
+
+class _FakeSide:
+    def __init__(self, name, answers):
+        self.name, self.answers, self.calls = name, answers, []
+
+    def call(self, verb, *args, timeout=0):
+        self.calls.append((verb, args))
+        a = self.answers[verb]
+        return a(args) if callable(a) else dict(a)
+
+
+def test_promote_reproves_catchup_against_the_current_fence_checkpoint(tmp_path):
+    sid = "20261124T160000Z-to-nas-fleet"
+    old = _FakeSide("studio", {
+        "_fence": {"checkpoint_lsn": "7E/100", "was_armed": True},
+        "_status": {"containers": {}, "role_file": "standby", "fence": {"swap_id": sid}}})
+    target = _FakeSide("nas-fleet", {
+        "_catchup": lambda args: {"replay_lsn": args[1], "checkpoint_lsn": args[1]},
+        "_promote": {"pg_in_recovery": False}})
+    st = {"steps": {"fence": {}, "catchup": {}}, "fence": {"checkpoint_lsn": "7D/5BEC278", "was_armed": True}}
+    sw = SW.Swap(sid, st, target, old, old, tmp_path)
+    r = sw.s_promote()
+    assert [c[0] for c in target.calls] == ["_catchup", "_promote"]
+    assert target.calls[0][1][:2] == ("--checkpoint-lsn", "7E/100")      # the re-fenced checkpoint, not the saved one
+    assert sw.st["fence"]["checkpoint_lsn"] == "7E/100" and r["checkpoint_lsn"] == "7E/100"
+
+
+def test_drill_load_counts_hits_and_refuses_an_empty_summary(tmp_path):
+    spec = importlib.util.spec_from_file_location("drill_load", STACK / "standby" / "drill" / "drill_load.py")
+    dl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dl)
+    assert dl.hits("[]") == 0 and dl.hits('[{"slug": "a"}]') == 1 and dl.hits('{"results": []}') == 0
+    (tmp_path / "load.jsonl").write_text(json.dumps({"t": 1, "kind": "write", "seq": 1, "ok": False}) + "\n")
+    assert dl.summary(tmp_path, "no-such-container-t_dd1e1edb") == 1     # no acked write is no evidence
+
+
+def test_primary_enable_replaces_tagged_lines_and_drops_any_slot():
+    t = PE.read_text()
+    assert 'if [[ $cur != "$HBA" ]]; then' in t and 'if [[ $have != "$want" ]]; then' in t
+    assert "address='$gw' and netmask='255.255.255.255'" in t
+    assert "where slot_name = '$slot' and not active" not in t
