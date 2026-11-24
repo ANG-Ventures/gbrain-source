@@ -1,0 +1,63 @@
+# standby/drill/drill-a.toml: one half of the `gbrainctl swap` drill pair (card t_dd1e1edb, STANDBY.md). NOT a serving
+# host: it plays the Studio (the primary, and the callers' host). standby/drill/drill.sh copies it to its run dir with
+# @RIG@ (the run dir) and @HOSTKEY@ (the rig sshd's host key) filled in. Both halves run on nas-fleet, each its own
+# compose project, ports 1543x / 1829x / 1828x, data under /srv/gbrain-standby/drill-t_dd1e1edb/a. The data is a
+# pg_basebackup COPY of the live gbrain-pg (drill.sh, "seed-copy"); production names and ports are never used here.
+name            = "drill-a"
+os              = "linux"
+arch            = "amd64"
+lan_ip          = "127.0.0.1"
+docker_host_gw  = "host.docker.internal"
+revision        = "7969d9685cfb37a2d7c695a6a94d4d4aaa4f4ae7"
+server_image    = "gbrain-server:7969d9685cfb-amd64"
+rerank_image    = "gbrain-rerank:7969d9685cfb-amd64"
+cron_image      = "gbrain-cron:7969d9685cfb-amd64"
+compose_project = "gbrain-swapdrill-a"
+compose_files   = ["docker-compose.yaml", "docker-compose.nas-fleet.yaml"]
+stack_dir       = "@RIG@/home-a/deploy/stack"
+pg_container    = "gbrain-swapdrill-a-pg"
+pg_volume       = "gbrainswapdrill_a_pg"
+ports           = { pg = 15433, serve = 18291, rerank = 18281 }
+relay_ports     = { anthropic = 18810 }
+rerank_tunnel        = true                 # the real GPU path from this box (read-only use of zerank-native)
+rerank_tunnel_target = "ace@192.168.1.216"
+rerank_primary       = "http://rerank-tunnel:18084"
+nas_backup       = false                    # the drill cron is never armed; no NAS key is rendered
+stack_uid        = 1000
+stack_gid        = 1000
+gbrain_home      = "/srv/gbrain-standby/drill-t_dd1e1edb/a/gbrain"
+brain_source     = "/srv/gbrain-standby/drill-t_dd1e1edb/a/gbrain/brain"
+git_name         = "gbrain-swapdrill"
+git_email        = "gbrain-swapdrill@localhost"
+receipts_dir     = "@RIG@/receipts-a"
+backup_stamp_dir = "@RIG@/stamps-a"
+restic           = { repo = "/nonexistent/drill-never-armed", host = "gbrain-swapdrill-a", init_ok = 0 }
+op_reader       = "~/.local/bin/op-cached-read"
+op_bin          = "/usr/bin/op"
+op_token_file   = "~/.hermes/.op-service-token"
+
+[swap]
+drill            = true
+callers_host     = "drill-a"
+callers_file     = "@RIG@/drill-a.toml"
+prove_client_env = "@RIG@/prove-client.env"
+
+[link]
+keys_file       = "@RIG@/sshd/authorized_keys"   # the rig sshd reads it; primary-enable.sh appends to it
+
+# how drill-a follows drill-b after `swap --to-file drill-b` (the Studio's [standby] shape)
+[standby]
+primary          = "drill-b"
+primary_file     = "@RIG@/drill-b.toml"
+link_ssh         = "_studiolink@192.168.1.154"   # the rig sshd: host network, port 22091
+link_port        = 22091
+link_host_key    = "@HOSTKEY@"
+link_from        = "172.16.0.0/12"               # the source is this half's own link container (a docker bridge)
+primary_pg       = "127.0.0.1:15434"
+primary_serve    = "127.0.0.1:18292"
+repl_role        = "gbrain_repl_drill_a"
+slot             = "gbrain_standby_drill_a"
+application_name = "drill-a"
+data_root        = "/srv/gbrain-standby/drill-t_dd1e1edb/a"
+lag_page_s       = 60
+basebackup_rate  = "100M"
