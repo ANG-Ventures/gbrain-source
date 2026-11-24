@@ -196,27 +196,26 @@ container sharing gbrain-pg's network namespace, `-X stream -r 100M`, its own te
 the Studio, streamed to the NAS and the volume removed: 322 s backup + 469 s transfer, 49,043 pages). Real images
 (amd64 at 7969d968), real 1P render, real rerank tunnel to ACE-AI; the drill cron is never armed and has no NAS key.
 
-Re-drilled at 6b0f046f (after the Prism rounds 2-3 fixes: promote re-fence and resume marker, fence recreates the
-stopped postgres container under the standby guard, two-phase reseed restore with a checked stop, atomic pg_hba /
-authorized_keys rewrites) on a fresh copy, 2026-11-24 17:06-17:41Z (`drill.sh setup`, `run`, then a fence-guard arm;
-the log was read before `teardown`). The copy: `pg_basebackup` 371 s, staged and rsynced to the NAS in 134 s,
-`pg_verifybackup` VERIFIED.
+Re-drilled after send-back 2 (undo refuses once promote_started is journaled, a guarded `_reseed`, the verifier on
+stdin, one seed per stack dir, the compose fence guard) on a fresh copy, 2026-11-24 18:48-19:36Z (`drill.sh setup`,
+`run`, `f2 b`, `f1 b`, `probe`, then `teardown`). Both halves ran the bytes of 4daae419; the final head differs from it
+only in this document and drill.sh f2's B4 step, which the f2 arm lacked and which was run by hand with the same
+command before f1. The copy: `pg_basebackup` 342 s, staged and rsynced to the NAS in 112 s.
 
 | what | result |
 |---|---|
-| render + init, A up on the copy | `INIT=ok` both halves; A's full stack `/health` engine=postgres 5 s after postgres |
-| primary-enable (A accepts B) | `hba_loaded 1`, `hba_errors 0`, `key_line present`, `APPLY=ok` |
-| `standby seed` of B, 30 GB through the ssh link | `basebackup rc=0 seconds=313`, `SEED=ok`, setup 340 s end to end |
-| B's doctor after the seed | `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes` |
-| swap 1, A -> B (`SWAP=ok steps=8/8`, 628 s) | preflight 0.6 s, fence 5.6 s, catchup 0.2 s, promote 9.9 s (re-fence + target status + promote), start 11.2 s, flip 4.7 s, prove 16.8 s, reseed_old 578.9 s |
-| callers during swap 1 | searches every 0.5 s: 1,190, 60 failed, longest failure window **30.0 s**; writes every 0.5 s: 1,264, 21 failed, longest **7.5 s**; **acked writes 1,243 / 1,243 present on the new primary** |
-| swap 2, B -> A (`SWAP=ok steps=8/8`, 547 s) | fence 4.7 s, catchup 0.2 s, promote 15.6 s, start 10.8 s, flip 4.6 s, prove 8.1 s, reseed_old 502.7 s |
-| callers during swap 2 | searches 1,059, 60 failed, longest **30.0 s**; writes 1,109, 29 failed, longest **9.0 s**; **acked writes 1,080 / 1,080 present** |
-| after each swap | `DRILL=ok`: the new standby's doctor `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes`; both serve ports answer engine=postgres and a search (282-479 ms) |
-| fence-guard arm: swap A -> B `--no-reseed`, then `gbrainctl compose -- restart postgres` on the fenced A | `SWAP=ok` 31 s; A's stopped container carries the guarded command; the restart leaves it `restarting exit=78` with `refused: no standby.signal` (never writable); `standby seed --reseed` of A from B: `SEED=ok` 511 s, `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes` |
+| `standby seed` of B, 30 GB through the ssh link | `basebackup rc=0 seconds=315`, `SEED=ok`, `STANDBY=FRESH lag_s=0.0 ELIGIBLE=yes` |
+| swap 1, A -> B (`SWAP=ok steps=8/8`, 651 s) | preflight 0.7 s, fence 3.5 s, catchup 0.2 s, promote 9.8 s, start 11.1 s, flip 4.6 s (verifier on stdin), prove 42.5 s, reseed_old 579.0 s |
+| callers during swap 1 | searches 1,261, 55 failed, longest **27.5 s**; writes 1,338, 18 failed, longest **4.5 s**; **acked writes 1,320 / 1,320 present** |
+| swap 2, B -> A (`SWAP=ok steps=8/8`, 563 s) | fence 6.0 s, catchup 0.2 s, promote 12.1 s, start 11.2 s, flip 4.3 s, prove 5.3 s, reseed_old 523.6 s; `DRILL=ok` |
+| callers during swap 2 | searches 1,132, 57 failed, longest **28.5 s**; writes 1,168, 26 failed, longest **9.5 s**; **acked writes 1,142 / 1,142 present** |
+| f2 (read F2): swap A -> B, failure injected at reseed_old, A put back by "Promoted but not serving" B1-B3 | B1 B's server, cron, postgres exited; B2 B's postgres guarded; B3 `_unfence` `{"ok":true,"pg_in_recovery":false,"health_ok":true}`, `_prove` hits 1; then `swap resume`: `reseed refused on drill-a: FENCE names swap None ...; ROLE='primary' (want standby); runs server,cron; postgres runs and is not a replica (in_recovery=f)`, rc 1; a bare `_reseed --swap-id` refused the same way, `_reseed` without an id refused (`--swap-id ... is required`); A before and after: `in_recovery=f pages=49043 marker=1 datadir=bc63f865b729 ROLE=primary FENCE=-` (unchanged); B5 `standby seed --reseed` of B: `SEED=ok` 467 s, FRESH, ELIGIBLE; B4 `SWAP=status open=-` |
+| f1 (read F1): swap A -> B, coordinator SIGKILLed once `promote_started` was journaled | B `in_recovery=t` at the kill; `swap undo`: `SWAP=refused ... the promotion of drill-b started (19:27:22Z): undo could leave two primaries`, rc 3; A still `ROLE=standby`, fenced by that swap, postgres not started; **B read `in_recovery=f` 20 s later** (the orphaned `_promote` finished on its own: the two-writer case undo used to allow); `swap resume`: `promote_resumed`, then `SWAP=ok steps=8/8` (reseed_old 509 s), A FRESH, ELIGIBLE |
+| teardown | 0 gbrain-swapdrill containers, 0 drill volumes, data dir and rig gone |
 
-The first drill (055a281c, 15:10-15:43Z) also ran an undo arm: an injected failure at promote, then `swap undo`:
-`SWAP=undone primary=drill-a` in 15 s. Its swap windows were 17.5 s / 33.6 s (searches) and 3.5 s / 5.0 s (writes).
+Earlier drills: 055a281c (15:10-15:43Z, with an undo arm: `SWAP=undone` in 15 s; windows 17.5 / 33.6 s searches,
+3.5 / 5.0 s writes) and 6b0f046f (17:06-17:41Z, with a fence-guard arm: a `compose restart postgres` on the fenced A
+exits 78; windows 30.0 / 30.0 s searches, 7.5 / 9.0 s writes; acked writes 1,243 / 1,243 and 1,080 / 1,080).
 
 What the numbers mean for production:
 - Callers lose ~20-35 s of searches per direction: fence -> start is ~20-30 s, and a freshly started server answers its
