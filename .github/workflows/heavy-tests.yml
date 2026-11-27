@@ -206,11 +206,14 @@ jobs:
       # pins the INSTALLER SCRIPT; the tag + commit pin the PAYLOAD it clones
       # (without them, the installer pulls upstream main into the runner that
       # later holds secrets). The commit is v2026.8.3's dereferenced SHA —
-      # immutable even if the tag moves.
+      # immutable even if the tag moves. The installer itself is fetched from
+      # that SAME commit (scripts/install.sh at HERMES_GIT_COMMIT), not the
+      # moving site URL: the site copy drifted 2026-11-08 and held this job
+      # red for 19 days, while the commit-addressed copy cannot change.
       HERMES_VERSION: "0.20.0"
       HERMES_GIT_TAG: "v2026.8.3"
       HERMES_GIT_COMMIT: "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
-      HERMES_INSTALL_SHA256: "2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af"
+      HERMES_INSTALL_SHA256: "45f589461248c7a6ec3aecd7522a69dd49c5c8dbf4798ba1296af5c0c5e7ccd3"
       GBRAIN_REAL_HERMES_E2E: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -245,19 +248,17 @@ jobs:
       - name: Install hermes (pinned installer digest)
         timeout-minutes: 15
         run: |
-          curl -fsSL --retry 3 -o hermes-install.sh https://hermes-agent.nousresearch.com/install.sh
+          curl -fsSL --retry 3 -o hermes-install.sh "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_GIT_COMMIT/scripts/install.sh"
           if ! echo "$HERMES_INSTALL_SHA256  hermes-install.sh" | sha256sum -c -; then
-            echo "::error::hermes installer digest drift — re-pin deliberately: update HERMES_INSTALL_SHA256 + HERMES_VERSION in this workflow and docs/mcp/HERMES-CLI-PIN.md after reviewing upstream changes" >&2
+            echo "::error::hermes installer digest drift — the installer is fetched at the pinned commit, so this means the pin moved without its digest: update HERMES_INSTALL_SHA256 together with HERMES_GIT_TAG/HERMES_GIT_COMMIT/HERMES_VERSION here and in docs/mcp/HERMES-CLI-PIN.md after reviewing upstream changes" >&2
             exit 1
           fi
           for attempt in 1 2 3; do
-            # --skip-browser --skip-computer-use: neither is needed by the
-            # door, and the computer-use sub-installer pipes an UNPINNED
-            # third-party script from raw.githubusercontent.com to bash — the
-            # one part of the install the sha256 + tag/commit pins don't
-            # cover. Skipping removes that surface entirely (review record in
-            # docs/mcp/HERMES-CLI-PIN.md).
-            if timeout 600 bash hermes-install.sh --skip-setup --non-interactive --skip-browser --skip-computer-use --branch "$HERMES_GIT_TAG" --commit "$HERMES_GIT_COMMIT"; then
+            # --skip-browser: not needed by the door. The tag's installer has
+            # no computer-use stage (and rejects unknown flags with exit 1),
+            # so the unpinned trycua sub-installer that later site installers
+            # carry is absent here by construction (docs/mcp/HERMES-CLI-PIN.md).
+            if timeout 600 bash hermes-install.sh --skip-setup --non-interactive --skip-browser --branch "$HERMES_GIT_TAG" --commit "$HERMES_GIT_COMMIT"; then
               # The branch/commit flags above are ASSERTED here, not trusted:
               # a shell installer that silently ignores unknown flags would
               # clone upstream main into a runner that later holds secrets.
@@ -294,24 +295,20 @@ jobs:
             exit 1
           fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
-            # Split posture: schedule/dispatch stay LOUD-FAIL — the owner is
-            # the audience there and owns the secret. A pull_request run's
-            # audience is a PR author who cannot fix repo secrets (fork PRs
-            # never receive them at all), and a permanently-red check trains
-            # reviewers to ignore this door — so on PRs the missing paid leg
-            # is a VISIBLE SKIP (warning + job summary), never a silent green.
-            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-              echo "paid=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::hermes door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty (owner-only fix: gh secret set ANTHROPIC_API_KEY). Installer digest + payload + version pins verified; no hermes turn ran." >&2
-              {
-                echo "## Hermes door: paid leg skipped"
-                echo "ANTHROPIC_API_KEY secret is empty — installer digest, payload, and version pins verified, but no hermes turn ran."
-                echo "The nightly schedule stays loud-fail until the owner sets the secret."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::error::ANTHROPIC_API_KEY secret is empty — this scheduled/dispatched run cannot cover the hermes door without it (owner-only fix: gh secret set ANTHROPIC_API_KEY)" >&2
-            exit 1
+            # VISIBLE SKIP on every trigger (warning + job summary), never a
+            # silent green. This repo has no ANTHROPIC_API_KEY secret; the
+            # earlier schedule/dispatch loud-fail held the nightly red every
+            # day for a secret nobody was going to set, which trains readers
+            # to ignore the door. Installer digest + payload + version pins
+            # are still verified above; setting the secret turns the paid leg
+            # back on with no workflow change.
+            echo "paid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::hermes door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty (owner-only fix: gh secret set ANTHROPIC_API_KEY). Installer digest + payload + version pins verified; no hermes turn ran." >&2
+            {
+              echo "## Hermes door: paid leg skipped"
+              echo "ANTHROPIC_API_KEY secret is empty — installer digest, payload, and version pins verified, but no hermes turn ran."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo "paid=true" >> "$GITHUB_OUTPUT"
 
@@ -868,24 +865,17 @@ jobs:
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             # Keyless coverage (incl. the SMOKE) is already banked above.
-            # Split posture: on pull_request the missing paid leg is a
-            # VISIBLE SKIP (fork PRs never receive secrets, and branch-PR
-            # authors cannot fix repo secrets either — a permanently-red
-            # check just trains reviewers to ignore this door); the nightly
-            # schedule + dispatch stay loud-fail so the owner sees red until
-            # the secret exists.
-            if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-              echo "paid=false" >> "$GITHUB_OUTPUT"
-              echo "::warning::opencode door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty (owner-only fix: gh secret set ANTHROPIC_API_KEY). Keyless tier (5 tests incl. the SMOKE) is banked above." >&2
-              {
-                echo "## opencode door: paid anthropic leg skipped"
-                echo "Keyless tier (5 tests, SMOKE included) passed; the paid leg needs the ANTHROPIC_API_KEY secret."
-                echo "The nightly schedule stays loud-fail until the owner sets the secret."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            echo "::error::ANTHROPIC_API_KEY secret is empty — the keyless tier above already ran (its coverage, including the SMOKE, is banked); the paid anthropic leg needs the secret hermes-door already consumes (owner-only fix: gh secret set ANTHROPIC_API_KEY)." >&2
-            exit 1
+            # VISIBLE SKIP on every trigger (warning + job summary): this repo
+            # has no ANTHROPIC_API_KEY secret, and the earlier schedule/
+            # dispatch loud-fail held the nightly red every day for it.
+            # Setting the secret turns the paid leg back on unchanged.
+            echo "paid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::opencode door PAID LEG SKIPPED — ANTHROPIC_API_KEY secret is empty (owner-only fix: gh secret set ANTHROPIC_API_KEY). Keyless tier (5 tests incl. the SMOKE) is banked above." >&2
+            {
+              echo "## opencode door: paid anthropic leg skipped"
+              echo "Keyless tier (5 tests, SMOKE included) passed; the paid leg needs the ANTHROPIC_API_KEY secret."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
           echo "paid=true" >> "$GITHUB_OUTPUT"
 
