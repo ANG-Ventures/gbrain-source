@@ -19,7 +19,16 @@ import { join } from 'node:path';
 import * as realEmbedding from '../src/core/embedding.ts';
 import * as realRerank from '../src/core/search/rerank.ts';
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/**
+ * Injected clock for A-1: only the injected delays advance it, so the real work
+ * between them (PGLite queries, config loads) costs 0 ms on it and a busy runner
+ * cannot move time into an uninstrumented stage. t_7087f163: on a loaded CI
+ * runner the `config` stage once took over 150 ms of wall time and failed the
+ * old "every other stage under 150 ms" check.
+ */
+let virtualNow = 0;
+const sleep = (ms: number) =>
+  new Promise<void>((r) => setTimeout(() => { virtualNow += ms; r(); }, ms));
 const DELAY = 300;
 
 /** Per-stage injected delay; reset before each run. */
@@ -193,6 +202,8 @@ const ISOLATED = [
 ] as const;
 
 describe('A-1: an injected 300 ms delay lands in its own stage only', () => {
+  beforeAll(() => _setStageTimingClockForTests(() => virtualNow));
+  afterAll(() => _setStageTimingClockForTests(null));
   for (const stage of ISOLATED) {
     test(stage, async () => {
       for (const k of Object.keys(delays)) delete delays[k];
@@ -202,14 +213,16 @@ describe('A-1: an injected 300 ms delay lands in its own stage only', () => {
       expect(rows.length).toBeGreaterThan(0);
       expect(timing).not.toBeNull();
       const t = timing!;
-      expect(t.stages[stage]).toBeGreaterThanOrEqual(DELAY - 10);
+      // On the injected clock the whole delay lands in `stage` and nowhere else.
+      expect(t.stages[stage]).toBe(DELAY);
       for (const [other, ms] of Object.entries(t.stages)) {
-        if (other !== stage) expect({ stage: other, ms: ms < 150 }).toEqual({ stage: other, ms: true });
+        if (other !== stage) expect({ stage: other, ms }).toEqual({ stage: other, ms: 0 });
       }
       // D-2: stages + unattributed reconcile with the measured latency.
+      expect(latency).toBe(DELAY);
       const sum = Object.values(t.stages).reduce((a, b) => a + b, 0);
-      expect(Math.abs(sum + t.unattributed_ms - latency)).toBeLessThan(2);
-      expect(t.unattributed_ms).toBeLessThan(DELAY / 2);
+      expect(sum + t.unattributed_ms).toBe(latency);
+      expect(t.unattributed_ms).toBe(0);
       expect(t.cache).toBe('miss');
       expect(t.query_len).toBe(`builder latency ${stage} run ${runN}`.length);
       expect(typeof t.rerank_in).toBe('number');
