@@ -63,7 +63,9 @@ file, the workflow pins, and the affected assertions together.
   `/usr/local/lib/hermes-agent`; the door's runners are non-root); npm-dep
   failures abort the install, absorbed by the door's 3-attempt retry;
   managed Node is v26.
-  (download https://hermes-agent.nousresearch.com/install.sh to a file first; verify; then run)
+  Re-pin: download `https://raw.githubusercontent.com/NousResearch/hermes-agent/<new HERMES_GIT_COMMIT>/scripts/install.sh`
+  to a file, review its delta, `sha256sum` it, then run it. Never re-pin from the site URL
+  (`hermes-agent.nousresearch.com/install.sh`): it is a moving file, not the installer of the pinned commit.
 - Installer flags used: `--skip-setup --non-interactive`; binary lands at `~/.local/bin/hermes`
 - Python 3.11.15 via uv (as observed 2026-08-12; since the 2026-09-24 installer pin a host with
   a supported system Python 3.11-3.13 reuses it, so CI runners may report their system 3.12)
