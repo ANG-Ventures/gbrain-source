@@ -12,8 +12,19 @@ file, the workflow pins, and the affected assertions together.
   version stamp; CI installs the RELEASE TAG `v2026.8.3` = commit `3c27eb62` — the two
   differ by post-release main commits, same declared version. If a CI door run ever
   diverges from these notes, re-observe against the tag checkout.)
-- Installer sha256: `2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af`
-  (re-pinned 2026-09-24 after the nightly digest-drift red, run 36006448561;
+- Installer sha256: `45f589461248c7a6ec3aecd7522a69dd49c5c8dbf4798ba1296af5c0c5e7ccd3` —
+  since 2026-11-27 CI fetches the installer from the PAYLOAD commit itself
+  (`raw.githubusercontent.com/NousResearch/hermes-agent/<HERMES_GIT_COMMIT>/scripts/install.sh`),
+  not from the site URL. The site copy changed on 2026-11-08 (served digest
+  `c73dad4d…` on 2026-11-27, a 1,320-line rewrite) and held the nightly red
+  for 19 days; a commit-addressed file cannot drift, and it is the installer
+  that shipped with the pinned release. Observed 2026-11-27 on Linux (ci-box,
+  isolated HOME, door flags minus `--skip-computer-use`): rc 0 in 156 s,
+  checkout HEAD `3c27eb62`, `Hermes Agent v0.20.0 (2026.8.3)`. That installer
+  has no computer-use stage and exits 1 on unknown flags, so the job no longer
+  passes `--skip-computer-use`. Outbound hosts in it: github, nousresearch,
+  astral/uv, nodejs.org, pypi, npmmirror, a duckduckgo probe.
+  History, superseded: site installer `2017ddf0…` (re-pinned 2026-09-24 after the nightly digest-drift red, run 36006448561;
   the served `scripts/install.sh` matched byte-for-byte against the upstream
   repo at `c7d2985ae3e2`). Delta review vs the previous pin (`2076946e…`,
   upstream `a071fc80d`, +370/-84 lines): no new outbound hosts, no
@@ -52,7 +63,9 @@ file, the workflow pins, and the affected assertions together.
   `/usr/local/lib/hermes-agent`; the door's runners are non-root); npm-dep
   failures abort the install, absorbed by the door's 3-attempt retry;
   managed Node is v26.
-  (download https://hermes-agent.nousresearch.com/install.sh to a file first; verify; then run)
+  Re-pin: download `https://raw.githubusercontent.com/NousResearch/hermes-agent/<new HERMES_GIT_COMMIT>/scripts/install.sh`
+  to a file, review its delta, `sha256sum` it, then run it. Never re-pin from the site URL
+  (`hermes-agent.nousresearch.com/install.sh`): it is a moving file, not the installer of the pinned commit.
 - Installer flags used: `--skip-setup --non-interactive`; binary lands at `~/.local/bin/hermes`
 - Python 3.11.15 via uv (as observed 2026-08-12; since the 2026-09-24 installer pin a host with
   a supported system Python 3.11-3.13 reuses it, so CI runners may report their system 3.12)
@@ -133,15 +146,15 @@ non-interactive. `hermes cron tick` = run due jobs once and exit. `hermes cron l
   `git -C ~/.hermes/hermes-agent rev-parse HEAD` and loud-fails on any mismatch, so an
   installer that silently ignores unknown flags (or a moved checkout layout) can never
   run unpinned upstream code on a runner that later holds secrets.
-- `HERMES_INSTALL_SHA256: "2017ddf0cc7bc6cfb70d40dc9fba1d916f47dbcccf5fe73bdee2cf93a11262af"`
+- `HERMES_INSTALL_SHA256: "45f589461248c7a6ec3aecd7522a69dd49c5c8dbf4798ba1296af5c0c5e7ccd3"` —
+  `scripts/install.sh` at `HERMES_GIT_COMMIT`; re-pin it together with the tag/commit.
 - Door test asserts `hermes --version` output contains `v$HERMES_VERSION` when the env var is set.
 - `hermes --version` output shape: `Hermes Agent v0.20.0 (2026.8.3)` + install dir + python lines.
-- Missing-secret posture is SPLIT by trigger: on `pull_request` the paid leg is
-  a VISIBLE SKIP (warning + job summary; installer digest, payload, and version
-  pins still verified — neither a fork nor a branch PR author can fix repo
-  secrets, and a permanently-red door trains reviewers to ignore it). The
-  nightly schedule and `workflow_dispatch` stay loud-fail so the owner sees red
-  until `gh secret set ANTHROPIC_API_KEY` runs.
+- A missing secret is a VISIBLE SKIP on every trigger (warning + job summary;
+  installer digest, payload, and version pins still verified). Schedule and
+  dispatch used to stay loud-fail, which held the nightly red from 2026-11-08
+  for a secret this repo does not have; `gh secret set ANTHROPIC_API_KEY`
+  turns the paid leg back on unchanged.
 
 ## Multi-provider 401 gotcha (door hermeticity)
 With `model.default` pinned to `anthropic/*` but a SECOND provider key visible (env or
